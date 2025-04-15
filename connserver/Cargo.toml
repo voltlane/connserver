@@ -1,5 +1,5 @@
 [package]
-name = "connection-server"
+name = "connserver"
 version = "0.1.0"
 edition = "2021"
 
