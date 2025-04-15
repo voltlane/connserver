@@ -2,4 +2,6 @@
 members = [
     "connserver",
     "echoserver",
+    "test-client",
 ]
+resolver = "2"
