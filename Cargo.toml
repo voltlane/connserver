@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "connserver",
-    "echoserver",
+    "echoserver", "enc",
     "test-client",
+    "enc",
 ]
 resolver = "2"
