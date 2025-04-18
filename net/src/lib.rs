@@ -137,7 +137,7 @@ pub async fn recv_size_prefixed(
 ///
 /// # Cancellation Safety
 ///
-/// This method is NOT cancellation safe.s
+/// This method is NOT cancellation safe.
 pub async fn send_size_prefixed(
     stream: &mut OwnedWriteHalf,
     message: &[u8],
