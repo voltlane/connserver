@@ -142,6 +142,9 @@ impl Connection {
             Ok(_) => return Err("Expected pong packet".into()),
             Err(e) => return Err(format!("Invalid pong packet: {}", e).into()),
         };
+
+        self.read = read;
+        self.write = write;
         Ok(())
     }
 }

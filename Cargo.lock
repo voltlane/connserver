@@ -933,6 +933,16 @@ name = "test-client"
 version = "0.1.0"
 
 [[package]]
+name = "test-client2"
+version = "0.1.0"
+dependencies = [
+ "clientcom",
+ "enc",
+ "net",
+ "tokio",
+]
+
+[[package]]
 name = "tokio"
 version = "1.44.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

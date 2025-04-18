@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use enc::encrypt;
 use ids::IdGenerator;
 use log::{error, info};
 use net::{ClientServerPacket, LowLevelPacket};
@@ -40,7 +41,7 @@ async fn handle_socket_duplex_slave(
                     }
                     Err(e) => {
                         error!("Slave: Error receiving packet for client {}: {}", client_id, e);
-                        break;
+                        return Err(e.into());
                     }
                 }
             }
@@ -107,6 +108,96 @@ struct StaleClient {
     encryption: enc::easy::Encryption,
 }
 
+async fn handle_connect(
+    read: &mut OwnedReadHalf,
+    write: &mut OwnedWriteHalf,
+    keys: &enc::easy::Keys,
+    mut client_id: u64,
+    stale_clients: &Mutex<HashMap<u64, StaleClient>>,
+) -> Result<(enc::easy::Encryption, u64), Box<dyn std::error::Error + Send + Sync>> {
+    let mut buffer = Vec::new();
+    net::recv_size_prefixed(read, &mut buffer).await?;
+    match ClientServerPacket::from_vec(buffer.clone()) {
+        Ok(ClientServerPacket::ProtocolVersion(version)) => {
+            if version != net::PROTOCOL_VERSION {
+                return Err(format!("Unsupported protocol version: {}", version).into());
+            }
+        }
+        Ok(_) => {
+            return Err("Expected protocol version packet".into());
+        }
+        Err(e) => {
+            return Err(format!("Invalid protocol version packet: {}", e).into());
+        }
+    }
+
+    // 0. send server key
+    let packet = ClientServerPacket::PubKey(keys.pubkey_to_bytes());
+    net::send_size_prefixed(write, &packet.into_vec()?).await?;
+
+    // 1. receive either pubkey or client id, depending if its a new connection or reconnection attempt
+    net::recv_size_prefixed(read, &mut buffer).await?;
+    match ClientServerPacket::from_vec(buffer.clone()) {
+        Ok(ClientServerPacket::PubKey(key)) => {
+            // new connection
+            info!("New client {} is connecting", client_id);
+            let their_pubkey = enc::easy::pubkey_from_bytes(&key)?;
+            // 2. send client id
+            let packet = ClientServerPacket::ClientId(client_id);
+            net::send_size_prefixed(write, &packet.into_vec()?).await?;
+            Ok((keys.create_encryption(&their_pubkey), client_id))
+        }
+        Ok(ClientServerPacket::ClientId(id)) => {
+            info!("A client is trying to reconnect as client {}", id);
+            client_id = id;
+            // reconnection attempt
+            // check if the client id is in the stale clients list
+            let mut stale_clients = stale_clients.lock().await;
+            let stale_client = match stale_clients.remove(&id) {
+                Some(stale_client) => stale_client,
+                None => return Err(format!("Client ID {} not found in stale clients", id).into()),
+            };
+
+            let challenge_bytes = enc::easy::random_bytes(32);
+            // encrypt the challenge
+            let encrypted_challenge = stale_client.encryption.encrypt(challenge_bytes.clone());
+            let packet = ClientServerPacket::Challenge(encrypted_challenge);
+            net::send_size_prefixed(write, &packet.into_vec()?).await?;
+
+            // receive the response
+            net::recv_size_prefixed(read, &mut buffer).await?;
+            let response = match ClientServerPacket::from_vec(buffer.clone()) {
+                Ok(ClientServerPacket::ChallengeResponse(response)) => response,
+                Ok(_) => return Err("Expected challenge response packet".into()),
+                Err(e) => return Err(format!("Invalid challenge response packet: {}", e).into()),
+            };
+
+            // decrypt the response
+            let decrypted_response = stale_client
+                .encryption
+                .decrypt(response)
+                .map_err(|e| format!("Failed to decrypt challenge response: {}", e))?;
+            // check if the decrypted response matches the challenge
+            if decrypted_response != challenge_bytes {
+                return Err("Challenge response does not match".into());
+            }
+
+            // receive ping and respond right back with it
+            net::recv_size_prefixed(read, &mut buffer).await?;
+            match ClientServerPacket::from_vec(buffer.clone()) {
+                Ok(ClientServerPacket::Ping) => {}
+                Ok(_) => return Err("Expected ping packet".into()),
+                Err(e) => return Err(format!("Invalid ping packet: {}", e).into()),
+            }
+            let packet = ClientServerPacket::Ping;
+            net::send_size_prefixed(write, &packet.into_vec()?).await?;
+
+            Ok((stale_client.encryption, client_id))
+        }
+        _ => Err("Expected client ID or public key packet".into()),
+    }
+}
+
 async fn multi_client_echo() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut master = TcpStream::connect(("127.0.0.1", 42001)).await?;
     net::configure_performance_tcp_socket(&mut master)?;
@@ -136,7 +227,6 @@ async fn multi_client_echo() -> Result<(), Box<dyn std::error::Error + Send + Sy
 
     tokio::spawn({
         let clients = clients.clone();
-        let stale_clients = stale_clients.clone();
         async move {
             // take messages from the master_recv_receiver and send them to each client
             loop {
@@ -180,8 +270,12 @@ async fn multi_client_echo() -> Result<(), Box<dyn std::error::Error + Send + Sy
         let (mut client, _) = acceptor.accept().await?;
         net::configure_performance_tcp_socket(&mut client)?;
 
-        let client_id = id_gen.next_id();
-        info!("Accepted client connection id={}", client_id);
+        let mut client_id = id_gen.next_id();
+        info!(
+            "Accepted client connection id={}, endpoint={:?}",
+            client_id,
+            client.peer_addr()
+        );
         // these are messages from master to client
         let (client_sender, client_receiver) = mpsc::channel::<Msg>(8_192);
         {
@@ -191,37 +285,42 @@ async fn multi_client_echo() -> Result<(), Box<dyn std::error::Error + Send + Sy
             let master_send_sender = master_send_sender.clone();
             let stale_clients = stale_clients.clone();
             let keys = keys.clone();
+            let clients = clients.clone();
             async move {
                 let (mut read, mut write) = client.into_split();
-                // handle id and pubkey exchange
-                // first, send our pubkey
-                // then receive their pubkey
-                // then send their id
-                // then start the duplex
-                let mut buffer = Vec::new();
-                if let Err(e) = net::send_size_prefixed(&mut write, &keys.pubkey_to_bytes()).await {
-                    error!("Error sending pubkey to client {}: {}", client_id, e);
-                    return;
-                }
-                if let Err(e) = net::recv_size_prefixed(&mut read, &mut buffer).await {
-                    error!("Error receiving pubkey from client {}: {}", client_id, e);
-                    return;
-                }
-                if buffer.len() < 8 {
-                    error!(
-                        "Error receiving pubkey from client {}: too small",
-                        client_id
+                let client_id_before = client_id;
+                let encryption =
+                    match handle_connect(&mut read, &mut write, &keys, client_id, &stale_clients)
+                        .await
+                    {
+                        Ok((enc, new_id)) => {
+                            client_id = new_id;
+                            info!("Client {} connected", client_id);
+                            enc
+                        }
+                        Err(e) => {
+                            error!("Error handling client {}: {}", client_id, e);
+                            return;
+                        }
+                    };
+                if client_id != client_id_before {
+                    info!(
+                        "Client ID changed from {} to {} due to reconnect",
+                        client_id_before, client_id
                     );
-                    return;
+                    let mut clients = clients.lock().await;
+                    let client_sender = match clients.remove(&client_id_before) {
+                        Some(sender) => sender,
+                        None => {
+                            error!(
+                                "Client ID {} not found in clients, but must exist",
+                                client_id_before
+                            );
+                            return;
+                        }
+                    };
+                    clients.insert(client_id, client_sender);
                 }
-                let their_pubkey = match enc::easy::pubkey_from_bytes(&buffer[0..8]) {
-                    Ok(pubkey) => Some(pubkey),
-                    Err(e) => {
-                        error!("Error parsing pubkey from client {}: {}", client_id, e);
-                        return;
-                    }
-                };
-
                 if let Err(e) = handle_socket_duplex_slave(
                     &mut read,
                     &mut write,
@@ -235,17 +334,9 @@ async fn multi_client_echo() -> Result<(), Box<dyn std::error::Error + Send + Sy
                         "Error handling client duplex for client {}: {}",
                         client_id, e
                     );
-                    if let Some(their_pubkey) = their_pubkey {
-                        let mut stale_clients = stale_clients.lock().await;
-                        stale_clients.insert(
-                            client_id,
-                            StaleClient {
-                                encryption: keys.create_encryption(&their_pubkey),
-                            },
-                        );
-                    }
+                    let mut stale_clients = stale_clients.lock().await;
+                    stale_clients.insert(client_id, StaleClient { encryption });
                 }
-
             }
         });
     }

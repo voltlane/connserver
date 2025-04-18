@@ -56,6 +56,15 @@ pub fn pubkey_from_bytes(bytes: &[u8]) -> k256::PublicKey {
 /// once you have the other party's public key. This will give you an `Encryption`
 /// instance, which you can use to encrypt and decrypt messages to/from that party.
 pub mod easy {
+    pub fn random_bytes(size: usize) -> Vec<u8> {
+        use chacha20poly1305::aead::OsRng;
+        use k256::elliptic_curve::rand_core::RngCore;
+        let mut bytes = vec![0u8; size];
+        let mut rng = OsRng {};
+        rng.fill_bytes(&mut bytes);
+        bytes
+    }
+
     pub type PubKey = k256::PublicKey;
 
     pub fn pubkey_from_bytes(bytes: &[u8]) -> Result<PubKey, k256::elliptic_curve::Error> {
