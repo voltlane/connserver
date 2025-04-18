@@ -11,6 +11,7 @@ tokio = { version = "1.44.1", features = ["full"] }
 tokio-util = { version = "0.7.14", features = ["full"] }
 net = { path = "../net" }
 enc = { path = "../enc" }
+anyhow = "1.0.98"
 
 [profile.release-with-debug]
 inherits = "release"

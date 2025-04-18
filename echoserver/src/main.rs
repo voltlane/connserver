@@ -2,7 +2,7 @@ use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:42001").await?;
     loop {
         let (mut socket, _) = listener.accept().await?;

@@ -7,3 +7,4 @@ edition = "2024"
 tokio = { version = "1.44.2", features = ["full"] }
 net = { path = "../net" }
 enc = { path = "../enc" }
+anyhow = "1.0.98"

@@ -61,7 +61,7 @@ pub struct TaggedPacket {
 /// Configures a TCP socket for performance by setting relevant socket options.
 pub fn configure_performance_tcp_socket(
     stream: &mut TcpStream,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_linger(Some(std::time::Duration::from_secs(5)))?;
     Ok(())
@@ -76,12 +76,12 @@ pub fn configure_performance_tcp_socket(
 async fn peek_all(
     stream: &mut OwnedReadHalf,
     buf: &mut [u8],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<()> {
     let mut total_read = 0;
     while total_read < buf.len() {
         total_read = stream.peek(buf).await?;
         if total_read == 0 {
-            return Err("Connection closed or Eof".into());
+            return Err(anyhow::format_err!("Connection closed or Eof"));
         }
     }
     Ok(())
@@ -96,7 +96,7 @@ async fn peek_all(
 pub async fn recv_size_prefixed(
     stream: &mut OwnedReadHalf,
     buffer: &mut Vec<u8>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<()> {
     let mut size_buf = [0u8; 4];
     // NOTE(lion): peek here to make sure we can get cancelled in the next read
     // without violating cancel safety
@@ -104,7 +104,7 @@ pub async fn recv_size_prefixed(
 
     let size = u32::from_be_bytes(size_buf) as usize;
     if size == 0 {
-        return Err("Packet too small".into());
+        return Err(anyhow::format_err!("Packet too small"));
     }
 
     // NOTE(lion): we need to peek the size + 4 bytes for the size itself,
@@ -119,10 +119,10 @@ pub async fn recv_size_prefixed(
 
     let n = stream.read(buffer).await?;
     if n == 0 {
-        return Err("Connection closed or Eof".into());
+        return Err(anyhow::format_err!("Connection closed or Eof"));
     }
     if n != buffer.len() {
-        return Err(format!("Partial read, expected {} got {} byte(s)", buffer.len(), n).into());
+        return Err(anyhow::format_err!("Partial read, expected {} got {} byte(s)", buffer.len(), n));
     }
 
     // NOTE(lion): we need to remove the size bytes from the buffer
@@ -141,7 +141,7 @@ pub async fn recv_size_prefixed(
 pub async fn send_size_prefixed(
     stream: &mut OwnedWriteHalf,
     message: &[u8],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<()> {
     let size = message.len() as u32;
     let size_bytes = size.to_be_bytes();
     let mut combined_message = Vec::with_capacity(4 + message.len());
@@ -160,10 +160,10 @@ pub async fn send_size_prefixed(
 pub async fn recv_tagged_packet(
     stream: &mut OwnedReadHalf,
     buffer: &mut Vec<u8>,
-) -> Result<TaggedPacket, Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<TaggedPacket> {
     recv_size_prefixed(stream, buffer).await?;
     if buffer.len() < 8 {
-        return Err("Packet too small".into());
+        return Err(anyhow::format_err!("Packet too small"));
     }
     let client_id = u64::from_be_bytes(buffer[0..8].try_into().unwrap());
     let buf = buffer[8..].into();
@@ -182,7 +182,7 @@ pub async fn recv_tagged_packet(
 pub async fn send_tagged_packet(
     stream: &mut OwnedWriteHalf,
     packet: TaggedPacket,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<()> {
     let size = packet.data.len() as u32 + 8;
     let size_bytes = size.to_be_bytes();
     let client_id_bytes = packet.client_id.to_be_bytes();

@@ -8,3 +8,4 @@ tokio = { version = "1.44.2", features = ["full"] }
 net = { path = "../net" }
 enc = { path = "../enc" }
 clientcom = { path = "../clientcom" }
+anyhow = "1.0.98"

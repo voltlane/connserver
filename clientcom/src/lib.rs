@@ -12,7 +12,7 @@ pub struct Connection {
 impl Connection {
     /// Creates a new connection to the server, with a new set of keys.
     /// To re-connect an existing connection, use `Connection::reconnect` instead.
-    pub async fn new(addr: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn new(addr: &str) -> anyhow::Result<Self> {
         let mut stream = TcpStream::connect(addr).await?;
         net::configure_performance_tcp_socket(&mut stream)?;
         let (mut read, mut write) = stream.into_split();
@@ -65,7 +65,7 @@ impl Connection {
         })
     }
 
-    pub async fn reconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn reconnect(&mut self) -> anyhow::Result<()> {
         // to reconnect, we first send the protocol version,
         // then we receive the server's public key and validate that it's the same we already know.
         // then we send out client id, which signals to the server that we're trying to reconnect.
