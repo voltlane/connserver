@@ -53,7 +53,7 @@ impl ClientServerPacket {
 }
 
 #[derive(Clone)]
-pub struct LowLevelPacket {
+pub struct TaggedPacket {
     pub client_id: u64,
     pub data: Vec<u8>,
 }
@@ -160,7 +160,7 @@ pub async fn send_size_prefixed(
 pub async fn recv_tagged_packet(
     stream: &mut OwnedReadHalf,
     buffer: &mut Vec<u8>,
-) -> Result<LowLevelPacket, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<TaggedPacket, Box<dyn std::error::Error + Send + Sync>> {
     recv_size_prefixed(stream, buffer).await?;
     if buffer.len() < 8 {
         return Err("Packet too small".into());
@@ -168,7 +168,7 @@ pub async fn recv_tagged_packet(
     let client_id = u64::from_be_bytes(buffer[0..8].try_into().unwrap());
     let buf = buffer[8..].into();
 
-    Ok(LowLevelPacket {
+    Ok(TaggedPacket {
         client_id,
         data: buf,
     })
@@ -181,7 +181,7 @@ pub async fn recv_tagged_packet(
 /// This method is NOT cancellation safe.
 pub async fn send_tagged_packet(
     stream: &mut OwnedWriteHalf,
-    packet: LowLevelPacket,
+    packet: TaggedPacket,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let size = packet.data.len() as u32 + 8;
     let size_bytes = size.to_be_bytes();

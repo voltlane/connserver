@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use enc::encrypt;
 use ids::IdGenerator;
 use log::{error, info};
-use net::{ClientServerPacket, LowLevelPacket};
+use net::{ClientServerPacket, TaggedPacket};
 use tokio::{
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -18,7 +18,7 @@ mod ids;
 #[derive(Clone)]
 enum Msg {
     Stop,
-    Data(LowLevelPacket),
+    Data(TaggedPacket),
 }
 
 async fn handle_socket_duplex_slave(
@@ -34,7 +34,7 @@ async fn handle_socket_duplex_slave(
             res = net::recv_size_prefixed(read, &mut buffer) => {
                 match res {
                     Ok(()) => {
-                        if let Err(e) = recv_sender.send(Msg::Data(LowLevelPacket { client_id, data: buffer.clone() })).await {
+                        if let Err(e) = recv_sender.send(Msg::Data(TaggedPacket { client_id, data: buffer.clone() })).await {
                             error!("Slave: Error sending message for client {}: {}", client_id, e);
                             return Err(e.into());
                         }
