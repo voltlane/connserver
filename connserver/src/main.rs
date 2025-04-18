@@ -198,6 +198,45 @@ async fn handle_connect(
     }
 }
 
+async fn master_recv_main_loop(
+    mut master_recv_receiver: mpsc::Receiver<Msg>,
+    clients: Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // take messages from the master_recv_receiver and send them to each client
+    loop {
+        if let Some(msg) = master_recv_receiver.recv().await {
+            match msg {
+                Msg::Data(packet) => {
+                    let client = {
+                        let clients = clients.lock().await;
+                        clients.get(&packet.client_id).cloned()
+                    };
+                    match client {
+                        Some(client_sender) => {
+                            if let Err(e) = client_sender.send(Msg::Data(packet.clone())).await {
+                                error!(
+                                    "Error sending message to client {}: {}",
+                                    packet.client_id, e
+                                );
+                            }
+                        }
+                        None => {
+                            error!(
+                                "Client {} not found; master server is sending bogus?",
+                                packet.client_id
+                            );
+                        }
+                    }
+                }
+                Msg::Stop => {
+                    info!("Stopping master recv");
+                    break Ok(());
+                }
+            }
+        }
+    }
+}
+
 async fn multi_client_echo() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut master = TcpStream::connect(("127.0.0.1", 42001)).await?;
     net::configure_performance_tcp_socket(&mut master)?;
@@ -210,7 +249,7 @@ async fn multi_client_echo() -> Result<(), Box<dyn std::error::Error + Send + Sy
     let mut id_gen = IdGenerator::new();
 
     let (master_send_sender, master_send_receiver) = mpsc::channel::<Msg>(32_768);
-    let (master_recv_sender, mut master_recv_receiver) = mpsc::channel::<Msg>(32_768);
+    let (master_recv_sender, master_recv_receiver) = mpsc::channel::<Msg>(32_768);
 
     tokio::spawn({
         async move {
@@ -228,117 +267,126 @@ async fn multi_client_echo() -> Result<(), Box<dyn std::error::Error + Send + Sy
     tokio::spawn({
         let clients = clients.clone();
         async move {
-            // take messages from the master_recv_receiver and send them to each client
-            loop {
-                if let Some(msg) = master_recv_receiver.recv().await {
-                    match msg {
-                        Msg::Data(packet) => {
-                            let client = {
-                                let clients = clients.lock().await;
-                                clients.get(&packet.client_id).cloned()
-                            };
-                            match client {
-                                Some(client_sender) => {
-                                    if let Err(e) =
-                                        client_sender.send(Msg::Data(packet.clone())).await
-                                    {
-                                        error!(
-                                            "Error sending message to client {}: {}",
-                                            packet.client_id, e
-                                        );
-                                    }
-                                }
-                                None => {
-                                    error!(
-                                        "Client {} not found; master server is sending bogus?",
-                                        packet.client_id
-                                    );
-                                }
-                            }
-                        }
-                        Msg::Stop => {
-                            info!("Stopping master recv");
-                            break;
-                        }
-                    }
-                }
+            if let Err(e) = master_recv_main_loop(master_recv_receiver, clients).await {
+                error!("Error handling master recv: {}", e);
             }
         }
     });
 
     loop {
-        let (mut client, _) = acceptor.accept().await?;
-        net::configure_performance_tcp_socket(&mut client)?;
-
-        let mut client_id = id_gen.next_id();
-        info!(
-            "Accepted client connection id={}, endpoint={:?}",
-            client_id,
-            client.peer_addr()
-        );
-        // these are messages from master to client
-        let (client_sender, client_receiver) = mpsc::channel::<Msg>(8_192);
+        if let Err(err) = accept_client(
+            &acceptor,
+            master_send_sender.clone(),
+            keys.clone(),
+            clients.clone(),
+            stale_clients.clone(),
+            &mut id_gen,
+        )
+        .await
         {
-            clients.lock().await.insert(client_id, client_sender);
+            error!("Failed accepting client: {}", err);
         }
-        tokio::spawn({
-            let master_send_sender = master_send_sender.clone();
-            let stale_clients = stale_clients.clone();
-            let keys = keys.clone();
-            let clients = clients.clone();
-            async move {
-                let (mut read, mut write) = client.into_split();
-                let client_id_before = client_id;
-                let encryption =
-                    match handle_connect(&mut read, &mut write, &keys, client_id, &stale_clients)
-                        .await
-                    {
-                        Ok((enc, new_id)) => {
-                            client_id = new_id;
-                            info!("Client {} connected", client_id);
-                            enc
-                        }
-                        Err(e) => {
-                            error!("Error handling client {}: {}", client_id, e);
-                            return;
-                        }
-                    };
-                if client_id != client_id_before {
-                    info!(
-                        "Client ID changed from {} to {} due to reconnect",
-                        client_id_before, client_id
-                    );
-                    let mut clients = clients.lock().await;
-                    let client_sender = match clients.remove(&client_id_before) {
-                        Some(sender) => sender,
-                        None => {
-                            error!(
-                                "Client ID {} not found in clients, but must exist",
-                                client_id_before
-                            );
-                            return;
-                        }
-                    };
-                    clients.insert(client_id, client_sender);
-                }
-                if let Err(e) = handle_socket_duplex_slave(
-                    &mut read,
-                    &mut write,
-                    client_receiver,
-                    master_send_sender,
-                    client_id,
-                )
-                .await
-                {
-                    error!(
-                        "Error handling client duplex for client {}: {}",
-                        client_id, e
-                    );
-                    let mut stale_clients = stale_clients.lock().await;
-                    stale_clients.insert(client_id, StaleClient { encryption });
-                }
+    }
+}
+
+async fn accept_client(
+    acceptor: &TcpListener,
+    master_send_sender: mpsc::Sender<Msg>,
+    keys: Arc<enc::easy::Keys>,
+    clients: Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>,
+    stale_clients: Arc<Mutex<HashMap<u64, StaleClient>>>,
+    id_gen: &mut IdGenerator,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (mut client, _) = acceptor.accept().await?;
+    net::configure_performance_tcp_socket(&mut client)?;
+
+    let client_id = id_gen.next_id();
+    info!(
+        "Accepted client connection id={}, endpoint={:?}",
+        client_id,
+        client.peer_addr()
+    );
+    // these are messages from master to client
+    let (client_sender, client_receiver) = mpsc::channel::<Msg>(8_192);
+    {
+        clients.lock().await.insert(client_id, client_sender);
+    }
+    tokio::spawn({
+        let master_send_sender = master_send_sender.clone();
+        let stale_clients = stale_clients.clone();
+        let keys = keys.clone();
+        let clients = clients.clone();
+        async move {
+            handle_client(
+                client,
+                master_send_sender,
+                client_receiver,
+                keys,
+                clients,
+                stale_clients,
+                client_id,
+            )
+        }
+    });
+    Ok(())
+}
+
+async fn handle_client(
+    client: TcpStream,
+    master_send_sender: mpsc::Sender<Msg>,
+    client_receiver: mpsc::Receiver<Msg>,
+    keys: Arc<enc::easy::Keys>,
+    clients: Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>,
+    stale_clients: Arc<Mutex<HashMap<u64, StaleClient>>>,
+    mut client_id: u64,
+) {
+    let (mut read, mut write) = client.into_split();
+    let client_id_before = client_id;
+    let encryption =
+        match handle_connect(&mut read, &mut write, &keys, client_id, &stale_clients).await {
+            Ok((enc, new_id)) => {
+                client_id = new_id;
+                info!("Client {} connected", client_id);
+                enc
             }
-        });
+            Err(e) => {
+                error!("Error handling client {}: {}", client_id, e);
+                return;
+            }
+        };
+    if client_id != client_id_before {
+        info!(
+            "Client ID changed from {} to {} due to reconnect",
+            client_id_before, client_id
+        );
+        let mut clients = clients.lock().await;
+        let client_sender = match clients.remove(&client_id_before) {
+            Some(sender) => sender,
+            None => {
+                error!(
+                    "Client ID {} not found in clients, but must exist",
+                    client_id_before
+                );
+                return;
+            }
+        };
+        clients.insert(client_id, client_sender);
+    }
+    if let Err(e) = handle_socket_duplex_slave(
+        &mut read,
+        &mut write,
+        client_receiver,
+        master_send_sender,
+        client_id,
+    )
+    .await
+    {
+        error!(
+            "Error handling client duplex for client {}: {}",
+            client_id, e
+        );
+        let mut stale_clients = stale_clients.lock().await;
+        stale_clients.insert(client_id, StaleClient { encryption });
     }
 }
 
