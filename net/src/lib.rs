@@ -157,7 +157,7 @@ pub async fn send_size_prefixed(
 ///
 /// This method IS cancellation safe. It peeks the data until it knows that enough data is available,
 /// and then reads it in a cancellation safe way.
-pub async fn recv_packet(
+pub async fn recv_tagged_packet(
     stream: &mut OwnedReadHalf,
     buffer: &mut Vec<u8>,
 ) -> Result<LowLevelPacket, Box<dyn std::error::Error + Send + Sync>> {
@@ -179,7 +179,7 @@ pub async fn recv_packet(
 /// # Cancellation Safety
 ///
 /// This method is NOT cancellation safe.
-pub async fn send_packet(
+pub async fn send_tagged_packet(
     stream: &mut OwnedWriteHalf,
     packet: LowLevelPacket,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -73,7 +73,7 @@ async fn handle_socket_duplex_master(
     let mut buffer = Vec::new();
     loop {
         tokio::select! {
-            packet = net::recv_packet(&mut read, &mut buffer) => {
+            packet = net::recv_tagged_packet(&mut read, &mut buffer) => {
                 match packet {
                     Ok(packet) => {
                         if let Err(e) = recv_sender.send(Msg::Data(packet.clone())).await {
@@ -89,7 +89,7 @@ async fn handle_socket_duplex_master(
             Some(msg) = send_receiver.recv() => {
                 match msg {
                     Msg::Data(packet) => {
-                        if let Err(e) = net::send_packet(&mut write, packet.clone()).await {
+                        if let Err(e) = net::send_tagged_packet(&mut write, packet.clone()).await {
                             panic!("Master: Error sending message for client {}: {}", packet.client_id, e);
                         }
                     }
