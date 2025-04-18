@@ -46,12 +46,22 @@ pub fn decrypt(
     cipher.decrypt(nonce, msg)
 }
 
+pub fn pubkey_from_bytes(bytes: &[u8]) -> k256::PublicKey {
+    k256::PublicKey::from_sec1_bytes(bytes).unwrap()
+}
+
 /// Easy to use API for encryption/decryption
 ///
 /// To use this, create a new `Keys` instance, then call `create_encryption`
 /// once you have the other party's public key. This will give you an `Encryption`
 /// instance, which you can use to encrypt and decrypt messages to/from that party.
 pub mod easy {
+    pub type PubKey = k256::PublicKey;
+
+    pub fn pubkey_from_bytes(bytes: &[u8]) -> Result<PubKey, k256::elliptic_curve::Error> {
+        k256::PublicKey::from_sec1_bytes(bytes)
+    }
+
     pub struct Keys {
         pub pubkey: k256::PublicKey,
         privkey: k256::ecdh::EphemeralSecret,
@@ -67,9 +77,13 @@ pub mod easy {
         }
 
         /// Create
-        pub fn create_encryption(&self, their_pubkey: &k256::PublicKey) -> Encryption {
+        pub fn create_encryption(&self, their_pubkey: &PubKey) -> Encryption {
             let shared_secret = super::generate_shared_secret(&their_pubkey, &self.privkey);
             Encryption { shared_secret }
+        }
+
+        pub fn pubkey_to_bytes(&self) -> Vec<u8> {
+            self.pubkey.to_sec1_bytes().to_vec()
         }
     }
 

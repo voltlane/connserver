@@ -23,12 +23,23 @@ use tokio::{
     },
 };
 
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Clone, bincode::Encode, bincode::Decode)]
 pub enum ClientServerPacket {
+    /// Bidirectional
+    /// used for checking the connection after reconnect
+    Ping,
+    /// Unidirectional Client -> Server
+    ProtocolVersion(u32),
     /// Bidirectional
     PubKey(Vec<u8>),
     /// Unidirectional Server -> Client
     ClientId(u64),
+    /// Unidirectional Server -> Client
+    Challenge(Vec<u8>),
+    /// Unidirectional Client -> Server
+    ChallengeResponse(Vec<u8>),
 }
 
 impl ClientServerPacket {

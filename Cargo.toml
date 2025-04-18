@@ -1,8 +1,3 @@
 [workspace]
-members = [
-    "connserver",
-    "echoserver", "enc",
-    "test-client",
-    "enc",
-]
+members = ["connserver", "echoserver", "test-client", "enc", "net", "clientcom"]
 resolver = "2"
