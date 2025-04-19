@@ -13,12 +13,187 @@ use tokio::{
 };
 
 mod args;
+mod config;
 mod ids;
 
 #[derive(Clone)]
 enum Msg {
     Stop,
     Data(TaggedPacket),
+}
+
+struct ConnServer {
+    keys: Arc<enc::easy::Keys>,
+    config: config::Config,
+}
+
+impl ConnServer {
+    async fn new(config: config::Config) -> Self {
+        let keys = Arc::new(enc::easy::Keys::new());
+        ConnServer { keys, config }
+    }
+
+    async fn run(&mut self) -> anyhow::Result<()> {
+        let mut master = TcpStream::connect(&self.config.master.address).await?;
+        net::configure_performance_tcp_socket(&mut master)?;
+
+        let acceptor = TcpListener::bind(&self.config.listener.address).await?;
+        info!("Listening on {}", acceptor.local_addr()?);
+
+        let keys = Arc::new(enc::easy::Keys::new());
+
+        let mut id_gen = Arc::new(Mutex::new(IdGenerator::new()));
+
+        let (master_send_sender, master_send_receiver) =
+            mpsc::channel::<Msg>(self.config.master.channel_capacity);
+        let (master_recv_sender, master_recv_receiver) =
+            mpsc::channel::<Msg>(self.config.master.channel_capacity);
+
+        tokio::spawn({
+            async move {
+                if let Err(e) =
+                    handle_socket_duplex_master(master, master_send_receiver, master_recv_sender)
+                        .await
+                {
+                    error!("Error handling master duplex: {}", e);
+                }
+            }
+        });
+
+        let clients = Arc::new(Mutex::new(HashMap::<u64, mpsc::Sender<Msg>>::new()));
+        let stale_clients = Arc::new(Mutex::new(HashMap::<u64, StaleClient>::new()));
+
+        tokio::spawn({
+            let stale_clients = stale_clients.clone();
+            let config = self.config.clone();
+            let id_gen = id_gen.clone();
+            async move {
+                handle_stale_clients(&stale_clients, &config, id_gen).await;
+            }
+        });
+
+        tokio::spawn({
+            let clients = clients.clone();
+            async move {
+                if let Err(e) = master_recv_main_loop(master_recv_receiver, clients).await {
+                    error!("Error handling master recv: {}", e);
+                }
+            }
+        });
+
+        loop {
+            if let Err(err) = self
+                .accept_client(
+                    &acceptor,
+                    master_send_sender.clone(),
+                    keys.clone(),
+                    clients.clone(),
+                    stale_clients.clone(),
+                    &id_gen,
+                )
+                .await
+            {
+                error!("Failed accepting client: {}", err);
+            }
+        }
+    }
+
+    async fn accept_client(
+        &self,
+        acceptor: &TcpListener,
+        master_send_sender: mpsc::Sender<Msg>,
+        keys: Arc<enc::easy::Keys>,
+        clients: Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>,
+        stale_clients: Arc<Mutex<HashMap<u64, StaleClient>>>,
+        id_gen: &Arc<Mutex<IdGenerator>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (mut client, _) = acceptor.accept().await?;
+        net::configure_performance_tcp_socket(&mut client)?;
+
+        let client_id = id_gen.lock().await.next_id();
+        info!(
+            "Accepted client connection id={}, endpoint={:?}",
+            client_id,
+            client.peer_addr()
+        );
+        // these are messages from master to client
+        let (client_sender, client_receiver) =
+            mpsc::channel::<Msg>(self.config.clients.channel_capacity);
+        {
+            clients.lock().await.insert(client_id, client_sender);
+        }
+        tokio::spawn({
+            let master_send_sender = master_send_sender.clone();
+            let stale_clients = stale_clients.clone();
+            let keys = keys.clone();
+            let clients = clients.clone();
+            let id_gen = id_gen.clone();
+            async move {
+                handle_client(
+                    client,
+                    master_send_sender,
+                    client_receiver,
+                    keys,
+                    clients,
+                    stale_clients,
+                    client_id,
+                    id_gen,
+                ).await
+            }
+        });
+        Ok(())
+    }
+}
+
+async fn handle_stale_clients(
+    stale_clients: &Arc<Mutex<HashMap<u64, StaleClient>>>,
+    config: &config::Config,
+    id_gen: Arc<Mutex<IdGenerator>>,
+) {
+    loop {
+        {
+            // lock scope
+            let mut stale_clients = stale_clients.lock().await;
+
+            let now = std::time::Instant::now();
+            let mut to_remove = Vec::new();
+            for (client_id, client) in stale_clients.iter_mut() {
+                if now.duration_since(client.disconnected).as_secs()
+                    > config.clients.stale_timeout_secs
+                {
+                    to_remove.push(*client_id);
+                }
+            }
+            for client_id in to_remove {
+                stale_clients.remove(&client_id);
+                id_gen.lock().await.release_id(client_id);
+                info!("Removed stale client {} due to stale_timeout", client_id);
+            }
+            // check if we have too many stale clients
+            if stale_clients.len() > config.clients.max_stale_clients as usize {
+                let mut clients = stale_clients
+                    .iter()
+                    .map(|(id, client)| (*id, client.disconnected))
+                    .collect::<Vec<_>>();
+                // Sorting clients by their disconnection time, oldest to newest
+                clients.sort_by(|(_, a), (_, b)| a.cmp(b));
+                let to_remove = clients
+                    .iter()
+                    .take(clients.len() - config.clients.max_stale_clients as usize)
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>();
+                for client_id in to_remove {
+                    stale_clients.remove(&client_id);
+                    id_gen.lock().await.release_id(client_id);
+                    info!("Removed stale client {} due to max_stale_clients", client_id);
+                }
+            }
+        } // lock scope
+        tokio::time::sleep(std::time::Duration::from_secs(
+            config.clients.stale_reap_interval_secs,
+        ))
+        .await;
+    }
 }
 
 async fn handle_socket_duplex_slave(
@@ -106,6 +281,7 @@ async fn handle_socket_duplex_master(
 
 struct StaleClient {
     encryption: enc::easy::Encryption,
+    disconnected: std::time::Instant,
 }
 
 async fn handle_connect(
@@ -237,100 +413,6 @@ async fn master_recv_main_loop(
     }
 }
 
-async fn multi_client_echo() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut master = TcpStream::connect(("127.0.0.1", 42001)).await?;
-    net::configure_performance_tcp_socket(&mut master)?;
-
-    let acceptor = TcpListener::bind(("0.0.0.0", 42000)).await?;
-    info!("Listening on {}", acceptor.local_addr()?);
-
-    let keys = Arc::new(enc::easy::Keys::new());
-
-    let mut id_gen = IdGenerator::new();
-
-    let (master_send_sender, master_send_receiver) = mpsc::channel::<Msg>(32_768);
-    let (master_recv_sender, master_recv_receiver) = mpsc::channel::<Msg>(32_768);
-
-    tokio::spawn({
-        async move {
-            if let Err(e) =
-                handle_socket_duplex_master(master, master_send_receiver, master_recv_sender).await
-            {
-                error!("Error handling master duplex: {}", e);
-            }
-        }
-    });
-
-    let clients = Arc::new(Mutex::new(HashMap::<u64, mpsc::Sender<Msg>>::new()));
-    let stale_clients = Arc::new(Mutex::new(HashMap::<u64, StaleClient>::new()));
-
-    tokio::spawn({
-        let clients = clients.clone();
-        async move {
-            if let Err(e) = master_recv_main_loop(master_recv_receiver, clients).await {
-                error!("Error handling master recv: {}", e);
-            }
-        }
-    });
-
-    loop {
-        if let Err(err) = accept_client(
-            &acceptor,
-            master_send_sender.clone(),
-            keys.clone(),
-            clients.clone(),
-            stale_clients.clone(),
-            &mut id_gen,
-        )
-        .await
-        {
-            error!("Failed accepting client: {}", err);
-        }
-    }
-}
-
-async fn accept_client(
-    acceptor: &TcpListener,
-    master_send_sender: mpsc::Sender<Msg>,
-    keys: Arc<enc::easy::Keys>,
-    clients: Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>,
-    stale_clients: Arc<Mutex<HashMap<u64, StaleClient>>>,
-    id_gen: &mut IdGenerator,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (mut client, _) = acceptor.accept().await?;
-    net::configure_performance_tcp_socket(&mut client)?;
-
-    let client_id = id_gen.next_id();
-    info!(
-        "Accepted client connection id={}, endpoint={:?}",
-        client_id,
-        client.peer_addr()
-    );
-    // these are messages from master to client
-    let (client_sender, client_receiver) = mpsc::channel::<Msg>(8_192);
-    {
-        clients.lock().await.insert(client_id, client_sender);
-    }
-    tokio::spawn({
-        let master_send_sender = master_send_sender.clone();
-        let stale_clients = stale_clients.clone();
-        let keys = keys.clone();
-        let clients = clients.clone();
-        async move {
-            handle_client(
-                client,
-                master_send_sender,
-                client_receiver,
-                keys,
-                clients,
-                stale_clients,
-                client_id,
-            )
-        }
-    });
-    Ok(())
-}
-
 async fn handle_client(
     client: TcpStream,
     master_send_sender: mpsc::Sender<Msg>,
@@ -339,6 +421,7 @@ async fn handle_client(
     clients: Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>,
     stale_clients: Arc<Mutex<HashMap<u64, StaleClient>>>,
     mut client_id: u64,
+    id_gen: Arc<Mutex<IdGenerator>>,
 ) {
     let (mut read, mut write) = client.into_split();
     let client_id_before = client_id;
@@ -371,6 +454,7 @@ async fn handle_client(
             }
         };
         clients.insert(client_id, client_sender);
+        id_gen.lock().await.release_id(client_id_before);
     }
     if let Err(e) = handle_socket_duplex_slave(
         &mut read,
@@ -386,7 +470,13 @@ async fn handle_client(
             client_id, e
         );
         let mut stale_clients = stale_clients.lock().await;
-        stale_clients.insert(client_id, StaleClient { encryption });
+        stale_clients.insert(
+            client_id,
+            StaleClient {
+                encryption,
+                disconnected: std::time::Instant::now(),
+            },
+        );
     }
 }
 
@@ -397,13 +487,33 @@ async fn main() {
         .format_timestamp(None)
         .init();
 
-    let args = args::Args::from_env();
-    if let Err(e) = args {
-        error!("Error: {}. Try --help.", e);
-        std::process::exit(1);
+    let args = match args::Args::from_env() {
+        Ok(val) => val,
+        Err(e) => {
+            error!("Error: {}. Try --help.", e);
+            std::process::exit(1);
+        }
+    };
+
+    let mut config = match config::Config::load_or_new("connserver.toml") {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Error loading config: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(listen_addr) = args.listen_addr {
+        info!("Overriding listener.address from commandline");
+        config.listener.address = listen_addr;
+    }
+    if let Some(master_addr) = args.master_addr {
+        info!("Overriding master.address from commandline");
+        config.master.address = master_addr;
     }
 
-    if let Err(err) = multi_client_echo().await {
+    let mut server = ConnServer::new(config).await;
+    if let Err(err) = server.run().await {
         error!("Error: {}", err);
         std::process::exit(1);
     }

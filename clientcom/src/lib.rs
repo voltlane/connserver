@@ -31,14 +31,14 @@ impl Connection {
         let pubkey_bytes = match net::ClientServerPacket::from_vec(buffer.clone()) {
             Ok(net::ClientServerPacket::PubKey(key)) => key,
             Ok(_) => {
-                return Err("Expected server public key packet".into());
+                return Err(anyhow::format_err!("Expected server public key packet"));
             }
-            Err(e) => return Err(format!("Invalid server public key packet: {}", e).into()),
+            Err(e) => return Err(anyhow::format_err!("Invalid server public key packet: {}", e)),
         };
         // validate it
         let server_pubkey = match enc::easy::pubkey_from_bytes(&pubkey_bytes) {
             Ok(val) => val,
-            Err(e) => return Err(format!("Invalid server public key: {}", e).into()),
+            Err(e) => return Err(anyhow::format_err!("Invalid server public key: {}", e)),
         };
 
         // 2. send my public key
@@ -51,8 +51,8 @@ impl Connection {
         net::recv_size_prefixed(&mut read, &mut buffer).await?;
         let client_id = match net::ClientServerPacket::from_vec(buffer) {
             Ok(net::ClientServerPacket::ClientId(id)) => id,
-            Ok(_) => return Err("Expected client ID packet".into()),
-            Err(e) => return Err(format!("Invalid client ID packet: {}", e).into()),
+            Ok(_) => return Err(anyhow::format_err!("Expected client ID packet")),
+            Err(e) => return Err(anyhow::format_err!("Invalid client ID packet: {}", e)),
         };
 
         Ok(Connection {
@@ -91,20 +91,20 @@ impl Connection {
         let pubkey_bytes = match net::ClientServerPacket::from_vec(buffer.clone()) {
             Ok(net::ClientServerPacket::PubKey(key)) => key,
             Ok(_) => {
-                return Err("Expected server public key packet".into());
+                return Err(anyhow::format_err!("Expected server public key packet"));
             }
-            Err(e) => return Err(format!("Invalid server public key packet: {}", e).into()),
+            Err(e) => return Err(anyhow::format_err!("Invalid server public key packet: {}", e)),
         };
 
         // validate it
         let server_pubkey = match enc::easy::pubkey_from_bytes(&pubkey_bytes) {
             Ok(val) => val,
-            Err(e) => return Err(format!("Invalid server public key: {}", e).into()),
+            Err(e) => return Err(anyhow::format_err!("Invalid server public key: {}", e)),
         };
 
         // check if the server's public key is the same as the one we already know
         if server_pubkey != self.server_pubkey {
-            return Err("Server public key does not match".into());
+            return Err(anyhow::format_err!("Server public key does not match"));
         }
 
         // 2. send my client id
@@ -115,15 +115,15 @@ impl Connection {
         net::recv_size_prefixed(&mut read, &mut buffer).await?;
         let challenge = match net::ClientServerPacket::from_vec(buffer.clone()) {
             Ok(net::ClientServerPacket::Challenge(challenge)) => challenge,
-            Ok(_) => return Err("Expected challenge packet".into()),
-            Err(e) => return Err(format!("Invalid challenge packet: {}", e).into()),
+            Ok(_) => return Err(anyhow::format_err!("Expected challenge packet")),
+            Err(e) => return Err(anyhow::format_err!("Invalid challenge packet: {}", e)),
         };
 
         // 4. decrypt challenge
         let encryption = self.keys.create_encryption(&self.server_pubkey);
         let decrypted_challenge = match encryption.decrypt(challenge) {
             Ok(val) => val,
-            Err(e) => return Err(format!("Failed to decrypt challenge: {}", e).into()),
+            Err(e) => return Err(anyhow::format_err!("Failed to decrypt challenge: {}", e)),
         };
 
         // 5. re-encrypt challenge with server's public key
@@ -139,8 +139,8 @@ impl Connection {
         net::recv_size_prefixed(&mut read, &mut buffer).await?;
         match net::ClientServerPacket::from_vec(buffer) {
             Ok(net::ClientServerPacket::Ping) => (),
-            Ok(_) => return Err("Expected pong packet".into()),
-            Err(e) => return Err(format!("Invalid pong packet: {}", e).into()),
+            Ok(_) => return Err(anyhow::format_err!("Expected pong packet")),
+            Err(e) => return Err(anyhow::format_err!("Invalid pong packet: {}", e)),
         };
 
         self.read = read;
