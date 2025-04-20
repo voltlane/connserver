@@ -111,7 +111,10 @@ pub async fn recv_size_prefixed(
     // because we need to read the size and the data in a cancellation safe way
     // otherwise we could read the size and then get cancelled before reading
     // the data, which would leave us with a partial read
-    buffer.resize(size + 4, 0);
+    buffer.reserve(size + 4);
+    unsafe {
+        buffer.set_len(size + 4);
+    }
     peek_all(stream, buffer).await?;
 
     let n = stream.read(buffer).await?;
