@@ -102,7 +102,7 @@ pub async fn recv_size_prefixed(
     // without violating cancel safety
     peek_all(stream, &mut size_buf).await?;
 
-    let size = u32::from_be_bytes(size_buf) as usize;
+    let size = u32::from_le_bytes(size_buf) as usize;
     if size == 0 {
         return Err(anyhow::format_err!("Packet too small"));
     }
@@ -143,7 +143,7 @@ pub async fn send_size_prefixed(
     message: &[u8],
 ) -> anyhow::Result<()> {
     let size = message.len() as u32;
-    let size_bytes = size.to_be_bytes();
+    let size_bytes = size.to_le_bytes();
     let mut combined_message = Vec::with_capacity(4 + message.len());
     combined_message.extend_from_slice(&size_bytes);
     combined_message.extend_from_slice(message);
@@ -165,7 +165,7 @@ pub async fn recv_tagged_packet(
     if buffer.len() < 8 {
         return Err(anyhow::format_err!("Packet too small"));
     }
-    let client_id = u64::from_be_bytes(buffer[0..8].try_into().unwrap());
+    let client_id = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
     let buf = buffer[8..].into();
 
     Ok(TaggedPacket {
@@ -184,8 +184,8 @@ pub async fn send_tagged_packet(
     packet: TaggedPacket,
 ) -> anyhow::Result<()> {
     let size = packet.data.len() as u32 + 8;
-    let size_bytes = size.to_be_bytes();
-    let client_id_bytes = packet.client_id.to_be_bytes();
+    let size_bytes = size.to_le_bytes();
+    let client_id_bytes = packet.client_id.to_le_bytes();
 
     let mut combined_message = Vec::with_capacity(4 + 8 + packet.data.len());
     combined_message.extend_from_slice(&size_bytes);
