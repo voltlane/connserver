@@ -67,7 +67,7 @@ pub fn configure_performance_tcp_socket(stream: &mut TcpStream) -> std::io::Resu
     Ok(())
 }
 
-pub fn new_framed_reader<T: AsyncRead + Unpin>(stream: T) -> FramedRead<T, LengthDelimitedCodec> {
+pub fn new_framed_reader<T: AsyncRead + Unpin>(stream: T) -> FramedReader<T> {
     LengthDelimitedCodec::builder()
         // NOTE(lion): do we want .max_frame_length(1024 * 1024 * 10) or something here?
         .length_field_type::<u32>()
@@ -77,9 +77,9 @@ pub fn new_framed_reader<T: AsyncRead + Unpin>(stream: T) -> FramedRead<T, Lengt
 
 /// Receives a size-prefixed message.
 ///
-/// Create a `FramedRead` with `new_framed_reader` and pass it to this function.
-pub async fn recv_size_prefixed<'a, T: AsyncRead + Unpin>(
-    read: &'a mut FramedRead<T, LengthDelimitedCodec>,
+/// Create a `FramedReader` with `new_framed_reader` and pass it to this function.
+pub async fn recv_size_prefixed<T: AsyncRead + Unpin>(
+    read: &mut FramedReader<T>,
 ) -> anyhow::Result<BytesMut> {
     Ok(read
         .next()
@@ -107,7 +107,7 @@ pub async fn send_size_prefixed<T: AsyncWriteExt + Unpin>(
 /// This method IS cancellation safe. It peeks the data until it knows that enough data is available,
 /// and then reads it in a cancellation safe way.
 pub async fn recv_tagged_packet<T: AsyncRead + Unpin>(
-    read: &mut FramedRead<T, LengthDelimitedCodec>,
+    read: &mut FramedReader<T>,
 ) -> anyhow::Result<TaggedPacket> {
     let buffer = recv_size_prefixed(read).await?;
     if buffer.len() < 8 {
