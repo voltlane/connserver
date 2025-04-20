@@ -73,6 +73,9 @@ pub fn new_framed_reader<T: AsyncRead + Unpin>(stream: T) -> FramedRead<T, Lengt
         .new_read(stream)
 }
 
+/// Receives a size-prefixed message.
+///
+/// Create a `FramedRead` with `new_framed_reader` and pass it to this function.
 pub async fn recv_size_prefixed<'a, T: AsyncRead + Unpin>(
     read: &'a mut FramedRead<T, LengthDelimitedCodec>,
 ) -> anyhow::Result<BytesMut> {
