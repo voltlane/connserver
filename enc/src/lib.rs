@@ -3,7 +3,7 @@ use chacha20poly1305::{
     AeadCore, KeyInit, XChaCha20Poly1305, XNonce,
 };
 
-const APP_SALT: &[u8] = b"LUUK-AND-LION";
+const APP_SALT: &[u8] = b"VOLTLANE.NET";
 
 pub fn generate_keypair() -> (
     k256::ecdh::EphemeralSecret, /* private key */
