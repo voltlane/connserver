@@ -58,7 +58,7 @@ All packets are size-prefixed:
     :                                                               |
     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-Packet Size is a 32-bit unsigned integer in big-endian format, indicating the total size of the packet, not including the size field itself. The Packet Data is a variable-length byte array containing the actual message content.
+Packet Size is a 32-bit unsigned integer in little-endian format, indicating the total size of the packet, not including the size field itself. The Packet Data is a variable-length byte array containing the actual message content.
 
 3.2. Voltlane-Backend Communication
 
