@@ -8,8 +8,6 @@ Voltlane’s multiplexed stream heals dropped clients and deflects attacks, lett
 
 ## The Problem
 
-> Turn N+1 into N=1.
-
 You're building a product which needs `N` connections; an IoT app, a multiplayer game, an app. You've named your product, picked a solid authentication method, chose a language and tech stack. Now, you're staring down the barrel of handling N concurrent connections:
 
 1. Concurrency tax: Every client demands a dedicated socket and a thread or task to go with it
@@ -33,3 +31,7 @@ You're building a product which needs `N` connections; an IoT app, a multiplayer
 - NOT a source of truth for your app (that's still your backend-/master-server)
 - NOT an authentication service—you will still need auth.
 - NOT a cryptographically secure data stream—you have to provide encryption of your streams (for now)
+
+## Spec
+
+See the [SPEC.txt](./SPEC.txt).
