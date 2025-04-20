@@ -1,0 +1,88 @@
+VOLTLANE PROTOCOL SPECIFICATION
+DRAFT v0.1
+
+Abstract
+
+Voltlane is a transport-layer protocol designed to multiplex multiple client connections into a single high-speed TCP stream between edge servers and backend services. By collapsing N concurrent connections into one managed firehose, Voltlane reduces server complexity, mitigates connection management overhead, and provides built-in mechanisms for secure reconnection. This document specifies the wire format, connection lifecycle, and operational characteristics of the Voltlane protocol.
+
+1. Introduction
+
+1.1. Motivation
+Modern distributed applications face significant overhead in managing concurrent client connections at scale. Traditional approaches require maintaining state for each client connection, handling intermittent network failures, and defending against edge-layer attacks. Voltlane addresses these challenges by introducing a multiplexed transport layer that abstracts connection management while preserving client isolation.
+
+1.2. Design Goals
+- Connection multiplexing: Combine thousands of client connections into a single TCP stream
+- Secure reconnection: Cryptographic validation of reconnecting clients
+- Operational simplicity: Reduce backend server complexity through connection abstraction
+- Attack resistance: Minimize exposed attack surface at the edge layer
+
+2. Protocol Overview
+
+2.1. System Architecture
+
+The Voltlane protocol operates between three components:
+
+    +--------+       +----------+      +---------+
+    | Client |       | Voltlane |      | Backend |
+    |        |<----->| Server   |<---->| Server  |
+    +--------+       +----------+      +---------+
+
+2.2. Core Capabilities
+
+Voltlane provides:
+- Multiplexing of N client connections into one TCP stream
+- Cryptographic client reconnection via ECDH (k256) + XChaCha20-Poly1305
+- Client identification through unique 64-bit IDs
+- Configurable DDoS protection parameters
+
+2.3. Explicit Non-Features
+Voltlane explicitly does NOT provide:
+- Load balancing functionality
+- Application-level session management
+- Backend state persistence
+- Primary authentication services
+
+3. Message Formats
+
+3.1 Size-Prefixed Packets
+
+All packets are size-prefixed:
+
+     0                   1                   2                   3
+     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                        Packet Size                            |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                                                               :
+    :                        Packet Data                            :
+    :                                                               |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+Packet Size is a 32-bit unsigned integer in big-endian format, indicating the total size of the packet, not including the size field itself. The Packet Data is a variable-length byte array containing the actual message content.
+
+3.2. Voltlane-Backend Communication
+
+Messages between Voltlane and Backend servers use tagged packets:
+
+     0                   1                   2                   3
+     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                        Packet Size                            |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                                                               |
+    +                        Client ID (64)                         +
+    |                                                               |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |    Flags (8)    |                                             |
+    +-+-+-+-+-+-+-+-+-+                                             +
+    |                         Data (variable)                       :
+    :                                                               :
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+The 32-bit size prefix from 3.1 is included here for completeness, but is not part of the tagged packet format. The Client ID is a 64-bit unsigned integer identifying the client. The Flags field is an 8-bit unsigned integer indicating the type of message. The Data field contains the actual message content.
+
+3.2.1. Tagged Packet Flags
+0x00: No flags (default data packet)
+0x01: Failure notification (client disconnected or buffer overflow)
+0x02: Kick command (force client disconnect)
+0x03: Reconnection notification
