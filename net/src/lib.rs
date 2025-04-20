@@ -25,6 +25,8 @@ use tokio_util::{bytes::BytesMut, codec::{FramedRead, LengthDelimitedCodec}};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+pub type FramedReader<T> = FramedRead<T, LengthDelimitedCodec>;
+
 #[derive(Clone, bincode::Encode, bincode::Decode)]
 pub enum ClientServerPacket {
     /// Bidirectional
