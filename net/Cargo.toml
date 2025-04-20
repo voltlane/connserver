@@ -6,4 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.98"
 bincode = "2.0.1"
+futures = "0.3.31"
 tokio = { version = "1.44.2", features = ["net"] }
+tokio-stream = "0.1.17"
+tokio-util = { version = "0.7.14", features = ["codec"] }

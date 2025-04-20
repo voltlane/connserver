@@ -14,14 +14,14 @@
 //! Finally, make sure you can explain why the code is the way it is before you change it. And please, don't
 //! assume that it was ever correct; so if you find a bug, it's probably real.
 //!
+use std::io::{Bytes, Read};
+
 use tokio::{
-    io::AsyncReadExt as _,
-    io::AsyncWriteExt as _,
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpStream,
-    },
+    io::{AsyncRead, AsyncWriteExt},
+    net::{tcp::OwnedWriteHalf, TcpStream},
 };
+use tokio_stream::StreamExt;
+use tokio_util::{bytes::BytesMut, codec::{FramedRead, LengthDelimitedCodec}};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -47,7 +47,7 @@ impl ClientServerPacket {
         bincode::encode_to_vec(self, bincode::config::standard())
     }
 
-    pub fn from_vec(data: Vec<u8>) -> Result<Self, bincode::error::DecodeError> {
+    pub fn from_slice(data: &[u8]) -> Result<Self, bincode::error::DecodeError> {
         bincode::decode_from_slice(&data, bincode::config::standard()).map(|(packet, _)| packet)
     }
 }
@@ -59,87 +59,31 @@ pub struct TaggedPacket {
 }
 
 /// Configures a TCP socket for performance by setting relevant socket options.
-pub fn configure_performance_tcp_socket(
-    stream: &mut TcpStream,
-) -> std::io::Result<()> {
+pub fn configure_performance_tcp_socket(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_linger(Some(std::time::Duration::from_secs(5)))?;
     Ok(())
 }
 
-/// Peeks all data from the stream until the buffer is filled.
-///
-/// # Cancellation Safety
-///
-/// This method IS cancellation safe, however it does not commit the read
-/// it performs. The caller must commit the read later to "confirm" it.
-async fn peek_all(
-    stream: &mut OwnedReadHalf,
-    buf: &mut [u8],
-) -> anyhow::Result<()> {
-    let mut total_read = 0;
-    while total_read < buf.len() {
-        total_read = stream.peek(buf).await?;
-        if total_read == 0 {
-            return Err(anyhow::format_err!("Connection closed or Eof"));
-        }
-    }
-    Ok(())
+pub fn new_framed_reader<T: AsyncRead + Unpin>(stream: T) -> FramedRead<T, LengthDelimitedCodec> {
+    LengthDelimitedCodec::builder()
+        // NOTE(lion): do we want .max_frame_length(1024 * 1024 * 10) or something here?
+        .length_field_type::<u32>()
+        .little_endian()
+        .new_read(stream)
 }
 
-/// Receives a size-prefixed message.
-///
-/// # Cancellation Safety
-///
-/// This method IS cancellation safe. It peeks the data until it knows that enough data is available,
-/// and then reads it in a cancellation safe way.
-pub async fn recv_size_prefixed(
-    stream: &mut OwnedReadHalf,
-    buffer: &mut Vec<u8>,
-) -> anyhow::Result<()> {
-    let mut size_buf = [0u8; 4];
-    // NOTE(lion): peek here to make sure we can get cancelled in the next read
-    // without violating cancel safety
-    peek_all(stream, &mut size_buf).await?;
-
-    let size = u32::from_le_bytes(size_buf) as usize;
-    if size == 0 {
-        return Err(anyhow::format_err!("Packet too small"));
-    }
-
-    // NOTE(lion): we need to peek the size + 4 bytes for the size itself,
-    // because we need to read the size and the data in a cancellation safe way
-    // otherwise we could read the size and then get cancelled before reading
-    // the data, which would leave us with a partial read
-    buffer.reserve(size + 4);
-    unsafe {
-        buffer.set_len(size + 4);
-    }
-    peek_all(stream, buffer).await?;
-
-    let n = stream.read(buffer).await?;
-    if n == 0 {
-        return Err(anyhow::format_err!("Connection closed or Eof"));
-    }
-    if n != buffer.len() {
-        return Err(anyhow::format_err!("Partial read, expected {} got {} byte(s)", buffer.len(), n));
-    }
-
-    // NOTE(lion): we need to remove the size bytes from the buffer
-    // because we only want the data. We need to avoid a copy here, too
-    // because we don't want to allocate a new buffer.
-    buffer.drain(..4);
-
-    Ok(())
+pub async fn recv_size_prefixed<'a, T: AsyncRead + Unpin>(
+    read: &'a mut FramedRead<T, LengthDelimitedCodec>,
+) -> anyhow::Result<BytesMut> {
+    Ok(read
+        .next()
+        .await
+        .ok_or_else(|| anyhow::format_err!("Connection closed or Eof"))??)
 }
 
-/// Sends a size-prefixed message.
-///
-/// # Cancellation Safety
-///
-/// This method is NOT cancellation safe.
-pub async fn send_size_prefixed(
-    stream: &mut OwnedWriteHalf,
+pub async fn send_size_prefixed<T: AsyncWriteExt + Unpin>(
+    stream: &mut T,
     message: &[u8],
 ) -> anyhow::Result<()> {
     let size = message.len() as u32;
@@ -157,11 +101,10 @@ pub async fn send_size_prefixed(
 ///
 /// This method IS cancellation safe. It peeks the data until it knows that enough data is available,
 /// and then reads it in a cancellation safe way.
-pub async fn recv_tagged_packet(
-    stream: &mut OwnedReadHalf,
-    buffer: &mut Vec<u8>,
+pub async fn recv_tagged_packet<T: AsyncRead + Unpin>(
+    read: &mut FramedRead<T, LengthDelimitedCodec>,
 ) -> anyhow::Result<TaggedPacket> {
-    recv_size_prefixed(stream, buffer).await?;
+    let buffer = recv_size_prefixed(read).await?;
     if buffer.len() < 8 {
         return Err(anyhow::format_err!("Packet too small"));
     }
