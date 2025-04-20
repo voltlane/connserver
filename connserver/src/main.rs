@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use connection::stale::StaleConnectionManager;
 use enc::encrypt;
 use ids::IdGenerator;
 use log::{error, info};
@@ -14,6 +15,7 @@ use tokio::{
 
 mod args;
 mod config;
+mod connection;
 mod ids;
 
 #[derive(Clone)]
@@ -42,7 +44,7 @@ impl ConnServer {
 
         let keys = Arc::new(enc::easy::Keys::new());
 
-        let mut id_gen = Arc::new(Mutex::new(IdGenerator::new()));
+        let id_gen = Arc::new(Mutex::new(IdGenerator::new()));
 
         let (master_send_sender, master_send_receiver) =
             mpsc::channel::<Msg>(self.config.master.channel_capacity);
@@ -61,16 +63,9 @@ impl ConnServer {
         });
 
         let clients = Arc::new(Mutex::new(HashMap::<u64, mpsc::Sender<Msg>>::new()));
-        let stale_clients = Arc::new(Mutex::new(HashMap::<u64, StaleClient>::new()));
+        let stale_conn_manager = StaleConnectionManager::new(self.config.clone());
 
-        tokio::spawn({
-            let stale_clients = stale_clients.clone();
-            let config = self.config.clone();
-            let id_gen = id_gen.clone();
-            async move {
-                handle_stale_clients(&stale_clients, &config, id_gen).await;
-            }
-        });
+        tokio::spawn(stale_conn_manager.clone().run_cleanup());
 
         tokio::spawn({
             let clients = clients.clone();
@@ -88,7 +83,7 @@ impl ConnServer {
                     master_send_sender.clone(),
                     keys.clone(),
                     clients.clone(),
-                    stale_clients.clone(),
+                    stale_conn_manager.clone(),
                     &id_gen,
                 )
                 .await
@@ -104,7 +99,7 @@ impl ConnServer {
         master_send_sender: mpsc::Sender<Msg>,
         keys: Arc<enc::easy::Keys>,
         clients: Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>,
-        stale_clients: Arc<Mutex<HashMap<u64, StaleClient>>>,
+        stale_conn_manager: StaleConnectionManager,
         id_gen: &Arc<Mutex<IdGenerator>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (mut client, _) = acceptor.accept().await?;
@@ -124,7 +119,6 @@ impl ConnServer {
         }
         tokio::spawn({
             let master_send_sender = master_send_sender.clone();
-            let stale_clients = stale_clients.clone();
             let keys = keys.clone();
             let clients = clients.clone();
             let id_gen = id_gen.clone();
@@ -135,64 +129,14 @@ impl ConnServer {
                     client_receiver,
                     keys,
                     clients,
-                    stale_clients,
+                    stale_conn_manager,
                     client_id,
                     id_gen,
-                ).await
+                )
+                .await
             }
         });
         Ok(())
-    }
-}
-
-async fn handle_stale_clients(
-    stale_clients: &Arc<Mutex<HashMap<u64, StaleClient>>>,
-    config: &config::Config,
-    id_gen: Arc<Mutex<IdGenerator>>,
-) {
-    loop {
-        {
-            // lock scope
-            let mut stale_clients = stale_clients.lock().await;
-
-            let now = std::time::Instant::now();
-            let mut to_remove = Vec::new();
-            for (client_id, client) in stale_clients.iter_mut() {
-                if now.duration_since(client.disconnected).as_secs()
-                    > config.clients.stale_timeout_secs
-                {
-                    to_remove.push(*client_id);
-                }
-            }
-            for client_id in to_remove {
-                stale_clients.remove(&client_id);
-                id_gen.lock().await.release_id(client_id);
-                info!("Removed stale client {} due to stale_timeout", client_id);
-            }
-            // check if we have too many stale clients
-            if stale_clients.len() > config.clients.max_stale_clients as usize {
-                let mut clients = stale_clients
-                    .iter()
-                    .map(|(id, client)| (*id, client.disconnected))
-                    .collect::<Vec<_>>();
-                // Sorting clients by their disconnection time, oldest to newest
-                clients.sort_by(|(_, a), (_, b)| a.cmp(b));
-                let to_remove = clients
-                    .iter()
-                    .take(clients.len() - config.clients.max_stale_clients as usize)
-                    .map(|(id, _)| *id)
-                    .collect::<Vec<_>>();
-                for client_id in to_remove {
-                    stale_clients.remove(&client_id);
-                    id_gen.lock().await.release_id(client_id);
-                    info!("Removed stale client {} due to max_stale_clients", client_id);
-                }
-            }
-        } // lock scope
-        tokio::time::sleep(std::time::Duration::from_secs(
-            config.clients.stale_reap_interval_secs,
-        ))
-        .await;
     }
 }
 
@@ -289,7 +233,7 @@ async fn handle_connect(
     write: &mut OwnedWriteHalf,
     keys: &enc::easy::Keys,
     mut client_id: u64,
-    stale_clients: &Mutex<HashMap<u64, StaleClient>>,
+    stale_conn_manager: &StaleConnectionManager,
 ) -> Result<(enc::easy::Encryption, u64), Box<dyn std::error::Error + Send + Sync>> {
     let mut buffer = Vec::new();
     net::recv_size_prefixed(read, &mut buffer).await?;
@@ -327,51 +271,64 @@ async fn handle_connect(
             info!("A client is trying to reconnect as client {}", id);
             client_id = id;
             // reconnection attempt
-            // check if the client id is in the stale clients list
-            let mut stale_clients = stale_clients.lock().await;
-            let stale_client = match stale_clients.remove(&id) {
+            let (stale_client_enc, stale_client_time) = match stale_conn_manager
+                .remove_stale_client(client_id)
+                .await
+            {
                 Some(stale_client) => stale_client,
                 None => return Err(format!("Client ID {} not found in stale clients", id).into()),
             };
 
-            let challenge_bytes = enc::easy::random_bytes(32);
-            // encrypt the challenge
-            let encrypted_challenge = stale_client.encryption.encrypt(challenge_bytes.clone());
-            let packet = ClientServerPacket::Challenge(encrypted_challenge);
-            net::send_size_prefixed(write, &packet.into_vec()?).await?;
-
-            // receive the response
-            net::recv_size_prefixed(read, &mut buffer).await?;
-            let response = match ClientServerPacket::from_vec(buffer.clone()) {
-                Ok(ClientServerPacket::ChallengeResponse(response)) => response,
-                Ok(_) => return Err("Expected challenge response packet".into()),
-                Err(e) => return Err(format!("Invalid challenge response packet: {}", e).into()),
-            };
-
-            // decrypt the response
-            let decrypted_response = stale_client
-                .encryption
-                .decrypt(response)
-                .map_err(|e| format!("Failed to decrypt challenge response: {}", e))?;
-            // check if the decrypted response matches the challenge
-            if decrypted_response != challenge_bytes {
-                return Err("Challenge response does not match".into());
+            if let Err(e) = do_reconnect(read, write, buffer, &stale_client_enc).await {
+                error!("Error during reconnection: {}", e);
+                stale_conn_manager
+                    .add_stale_client(client_id, stale_client_enc, stale_client_time)
+                    .await?;
+                return Err(format!("Failed to reconnect client {}: {}", client_id, e).into());
+            } else {
+                Ok((stale_client_enc, client_id))
             }
-
-            // receive ping and respond right back with it
-            net::recv_size_prefixed(read, &mut buffer).await?;
-            match ClientServerPacket::from_vec(buffer.clone()) {
-                Ok(ClientServerPacket::Ping) => {}
-                Ok(_) => return Err("Expected ping packet".into()),
-                Err(e) => return Err(format!("Invalid ping packet: {}", e).into()),
-            }
-            let packet = ClientServerPacket::Ping;
-            net::send_size_prefixed(write, &packet.into_vec()?).await?;
-
-            Ok((stale_client.encryption, client_id))
         }
         _ => Err("Expected client ID or public key packet".into()),
     }
+}
+
+async fn do_reconnect(
+    read: &mut OwnedReadHalf,
+    write: &mut OwnedWriteHalf,
+    mut buffer: Vec<u8>,
+    stale_client_enc: &enc::easy::Encryption,
+) -> anyhow::Result<()> {
+    let challenge_bytes = enc::easy::random_bytes(32);
+    let encrypted_challenge = stale_client_enc.encrypt(challenge_bytes.clone());
+    let packet = ClientServerPacket::Challenge(encrypted_challenge);
+    net::send_size_prefixed(write, &packet.into_vec()?).await?;
+    net::recv_size_prefixed(read, &mut buffer).await?;
+    let response = match ClientServerPacket::from_vec(buffer.clone()) {
+        Ok(ClientServerPacket::ChallengeResponse(response)) => response,
+        Ok(_) => return Err(anyhow::format_err!("Expected challenge response packet")),
+        Err(e) => {
+            return Err(anyhow::format_err!(
+                "Invalid challenge response packet: {}",
+                e
+            ))
+        }
+    };
+    let decrypted_response = stale_client_enc
+        .decrypt(response)
+        .map_err(|e| anyhow::format_err!("Failed to decrypt challenge response: {}", e))?;
+    if decrypted_response != challenge_bytes {
+        return Err(anyhow::format_err!("Challenge response does not match"));
+    }
+    net::recv_size_prefixed(read, &mut buffer).await?;
+    match ClientServerPacket::from_vec(buffer.clone()) {
+        Ok(ClientServerPacket::Ping) => {}
+        Ok(_) => return Err(anyhow::format_err!("Expected ping packet")),
+        Err(e) => return Err(anyhow::format_err!("Invalid ping packet: {}", e)),
+    }
+    let packet = ClientServerPacket::Ping;
+    net::send_size_prefixed(write, &packet.into_vec()?).await?;
+    Ok(())
 }
 
 async fn master_recv_main_loop(
@@ -419,14 +376,14 @@ async fn handle_client(
     client_receiver: mpsc::Receiver<Msg>,
     keys: Arc<enc::easy::Keys>,
     clients: Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>,
-    stale_clients: Arc<Mutex<HashMap<u64, StaleClient>>>,
+    stale_conn_manager: StaleConnectionManager,
     mut client_id: u64,
     id_gen: Arc<Mutex<IdGenerator>>,
 ) {
     let (mut read, mut write) = client.into_split();
     let client_id_before = client_id;
     let encryption =
-        match handle_connect(&mut read, &mut write, &keys, client_id, &stale_clients).await {
+        match handle_connect(&mut read, &mut write, &keys, client_id, &stale_conn_manager).await {
             Ok((enc, new_id)) => {
                 client_id = new_id;
                 info!("Client {} connected", client_id);
@@ -469,14 +426,7 @@ async fn handle_client(
             "Error handling client duplex for client {}: {}",
             client_id, e
         );
-        let mut stale_clients = stale_clients.lock().await;
-        stale_clients.insert(
-            client_id,
-            StaleClient {
-                encryption,
-                disconnected: std::time::Instant::now(),
-            },
-        );
+        stale_conn_manager.add_stale_client(client_id, encryption, std::time::Instant::now());
     }
 }
 
