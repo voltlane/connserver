@@ -8,3 +8,4 @@ tokio = { version = "1.44.2", features = ["full"] }
 net = { path = "../net" }
 enc = { path = "../enc" }
 anyhow = "1.0.98"
+tokio-util = { version = "0.7.14", features = ["codec"] }

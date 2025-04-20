@@ -36,7 +36,7 @@ impl StaleConnectionManager {
         client_id: u64,
         encryption: enc::easy::Encryption,
         disconnected: std::time::Instant,
-    ) -> anyhow::Result<()> {
+    ) {
         let mut clients = self.inner.clients.write().await;
         clients.insert(
             client_id,
@@ -45,7 +45,6 @@ impl StaleConnectionManager {
                 disconnected,
             },
         );
-        Ok(())
     }
 
     pub async fn remove_stale_client(
@@ -60,7 +59,7 @@ impl StaleConnectionManager {
         }
     }
 
-    pub async fn run_cleanup(&self) {
+    pub async fn run_cleanup(self) {
         loop {
             self.cleanup().await;
             tokio::time::sleep(std::time::Duration::from_secs(

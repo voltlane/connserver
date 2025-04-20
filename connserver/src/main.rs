@@ -1,7 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
 use connection::stale::StaleConnectionManager;
-use enc::encrypt;
 use ids::IdGenerator;
 use log::{error, info};
 use net::{ClientServerPacket, TaggedPacket};
@@ -12,6 +11,7 @@ use tokio::{
     },
     sync::{mpsc, Mutex},
 };
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
 mod args;
 mod config;
@@ -64,7 +64,6 @@ impl ConnServer {
 
         let clients = Arc::new(Mutex::new(HashMap::<u64, mpsc::Sender<Msg>>::new()));
         let stale_conn_manager = StaleConnectionManager::new(self.config.clone());
-
         tokio::spawn(stale_conn_manager.clone().run_cleanup());
 
         tokio::spawn({
@@ -141,19 +140,18 @@ impl ConnServer {
 }
 
 async fn handle_socket_duplex_slave(
-    read: &mut OwnedReadHalf,
+    read: &mut net::FramedReader<OwnedReadHalf>,
     write: &mut OwnedWriteHalf,
     mut send_receiver: mpsc::Receiver<Msg>,
     recv_sender: mpsc::Sender<Msg>,
     client_id: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut buffer = Vec::new();
     loop {
         tokio::select! {
-            res = net::recv_size_prefixed(read, &mut buffer) => {
+            res = net::recv_size_prefixed(read) => {
                 match res {
-                    Ok(()) => {
-                        if let Err(e) = recv_sender.send(Msg::Data(TaggedPacket { client_id, data: buffer.clone() })).await {
+                    Ok(buffer) => {
+                        if let Err(e) = recv_sender.send(Msg::Data(TaggedPacket { client_id, data: buffer.to_vec() })).await {
                             error!("Slave: Error sending message for client {}: {}", client_id, e);
                             return Err(e.into());
                         }
@@ -188,11 +186,11 @@ async fn handle_socket_duplex_master(
     mut send_receiver: mpsc::Receiver<Msg>,
     recv_sender: mpsc::Sender<Msg>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (mut read, mut write) = socket.into_split();
-    let mut buffer = Vec::new();
+    let (read, mut write) = socket.into_split();
+    let mut read = net::new_framed_reader(read);
     loop {
         tokio::select! {
-            packet = net::recv_tagged_packet(&mut read, &mut buffer) => {
+            packet = net::recv_tagged_packet(&mut read) => {
                 match packet {
                     Ok(packet) => {
                         if let Err(e) = recv_sender.send(Msg::Data(packet.clone())).await {
@@ -229,15 +227,14 @@ struct StaleClient {
 }
 
 async fn handle_connect(
-    read: &mut OwnedReadHalf,
+    read: &mut net::FramedReader<OwnedReadHalf>,
     write: &mut OwnedWriteHalf,
     keys: &enc::easy::Keys,
     mut client_id: u64,
     stale_conn_manager: &StaleConnectionManager,
 ) -> Result<(enc::easy::Encryption, u64), Box<dyn std::error::Error + Send + Sync>> {
-    let mut buffer = Vec::new();
-    net::recv_size_prefixed(read, &mut buffer).await?;
-    match ClientServerPacket::from_vec(buffer.clone()) {
+    let buffer = net::recv_size_prefixed(read).await?;
+    match ClientServerPacket::from_slice(&buffer) {
         Ok(ClientServerPacket::ProtocolVersion(version)) => {
             if version != net::PROTOCOL_VERSION {
                 return Err(format!("Unsupported protocol version: {}", version).into());
@@ -256,8 +253,8 @@ async fn handle_connect(
     net::send_size_prefixed(write, &packet.into_vec()?).await?;
 
     // 1. receive either pubkey or client id, depending if its a new connection or reconnection attempt
-    net::recv_size_prefixed(read, &mut buffer).await?;
-    match ClientServerPacket::from_vec(buffer.clone()) {
+    let buffer = net::recv_size_prefixed(read).await?;
+    match ClientServerPacket::from_slice(&buffer) {
         Ok(ClientServerPacket::PubKey(key)) => {
             // new connection
             info!("New client {} is connecting", client_id);
@@ -279,11 +276,11 @@ async fn handle_connect(
                 None => return Err(format!("Client ID {} not found in stale clients", id).into()),
             };
 
-            if let Err(e) = do_reconnect(read, write, buffer, &stale_client_enc).await {
+            if let Err(e) = do_reconnect(read, write, &stale_client_enc).await {
                 error!("Error during reconnection: {}", e);
                 stale_conn_manager
                     .add_stale_client(client_id, stale_client_enc, stale_client_time)
-                    .await?;
+                    .await;
                 return Err(format!("Failed to reconnect client {}: {}", client_id, e).into());
             } else {
                 Ok((stale_client_enc, client_id))
@@ -294,17 +291,16 @@ async fn handle_connect(
 }
 
 async fn do_reconnect(
-    read: &mut OwnedReadHalf,
+    read: &mut FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
     write: &mut OwnedWriteHalf,
-    mut buffer: Vec<u8>,
     stale_client_enc: &enc::easy::Encryption,
 ) -> anyhow::Result<()> {
     let challenge_bytes = enc::easy::random_bytes(32);
     let encrypted_challenge = stale_client_enc.encrypt(challenge_bytes.clone());
     let packet = ClientServerPacket::Challenge(encrypted_challenge);
     net::send_size_prefixed(write, &packet.into_vec()?).await?;
-    net::recv_size_prefixed(read, &mut buffer).await?;
-    let response = match ClientServerPacket::from_vec(buffer.clone()) {
+    let buffer = net::recv_size_prefixed(read).await?;
+    let response = match ClientServerPacket::from_slice(&buffer) {
         Ok(ClientServerPacket::ChallengeResponse(response)) => response,
         Ok(_) => return Err(anyhow::format_err!("Expected challenge response packet")),
         Err(e) => {
@@ -320,8 +316,8 @@ async fn do_reconnect(
     if decrypted_response != challenge_bytes {
         return Err(anyhow::format_err!("Challenge response does not match"));
     }
-    net::recv_size_prefixed(read, &mut buffer).await?;
-    match ClientServerPacket::from_vec(buffer.clone()) {
+    let buffer = net::recv_size_prefixed(read).await?;
+    match ClientServerPacket::from_slice(&buffer) {
         Ok(ClientServerPacket::Ping) => {}
         Ok(_) => return Err(anyhow::format_err!("Expected ping packet")),
         Err(e) => return Err(anyhow::format_err!("Invalid ping packet: {}", e)),
@@ -380,7 +376,8 @@ async fn handle_client(
     mut client_id: u64,
     id_gen: Arc<Mutex<IdGenerator>>,
 ) {
-    let (mut read, mut write) = client.into_split();
+    let (read, mut write) = client.into_split();
+    let mut read = net::new_framed_reader(read);
     let client_id_before = client_id;
     let encryption =
         match handle_connect(&mut read, &mut write, &keys, client_id, &stale_conn_manager).await {
@@ -426,7 +423,7 @@ async fn handle_client(
             "Error handling client duplex for client {}: {}",
             client_id, e
         );
-        stale_conn_manager.add_stale_client(client_id, encryption, std::time::Instant::now());
+        stale_conn_manager.add_stale_client(client_id, encryption, std::time::Instant::now()).await;
     }
 }
 

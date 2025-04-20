@@ -27,11 +27,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             // Receive the response from the server
-            let mut response_buf = Vec::new();
-            if let Err(e) = net::recv_size_prefixed(&mut client.read, &mut response_buf).await {
-                eprintln!("Error receiving data from server: {}", e);
-                break;
-            }
+            let response_buf = match net::recv_size_prefixed(&mut client.read).await {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("Error receiving data from server: {}", err);
+                    break;
+                }
+            };
 
             // Print the response to stdout
             if let Err(e) = std::io::stdout().write_all(&response_buf) {

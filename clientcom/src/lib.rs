@@ -1,7 +1,8 @@
-use tokio::net::TcpStream;
+use tokio::net::{tcp::OwnedReadHalf, TcpStream};
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
 pub struct Connection {
-    pub read: tokio::net::tcp::OwnedReadHalf,
+    pub read: FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
     pub write: tokio::net::tcp::OwnedWriteHalf,
     pub keys: enc::easy::Keys,
     pub server_pubkey: enc::easy::PubKey,
@@ -15,9 +16,8 @@ impl Connection {
     pub async fn new(addr: &str) -> anyhow::Result<Self> {
         let mut stream = TcpStream::connect(addr).await?;
         net::configure_performance_tcp_socket(&mut stream)?;
-        let (mut read, mut write) = stream.into_split();
-
-        let mut buffer = Vec::new();
+        let (read, mut write) = stream.into_split();
+        let mut read = net::new_framed_reader(read);
 
         // 0. send the current protocol version
         net::send_size_prefixed(
@@ -27,8 +27,8 @@ impl Connection {
         .await?;
 
         // 1. receive server public key
-        net::recv_size_prefixed(&mut read, &mut buffer).await?;
-        let pubkey_bytes = match net::ClientServerPacket::from_vec(buffer.clone()) {
+        let buffer = net::recv_size_prefixed(&mut read).await?;
+        let pubkey_bytes = match net::ClientServerPacket::from_slice(&buffer) {
             Ok(net::ClientServerPacket::PubKey(key)) => key,
             Ok(_) => {
                 return Err(anyhow::format_err!("Expected server public key packet"));
@@ -48,8 +48,8 @@ impl Connection {
         net::send_size_prefixed(&mut write, &packet.into_vec()?).await?;
 
         // 3. receive my client id
-        net::recv_size_prefixed(&mut read, &mut buffer).await?;
-        let client_id = match net::ClientServerPacket::from_vec(buffer) {
+        let buffer = net::recv_size_prefixed(&mut read).await?;
+        let client_id = match net::ClientServerPacket::from_slice(&buffer) {
             Ok(net::ClientServerPacket::ClientId(id)) => id,
             Ok(_) => return Err(anyhow::format_err!("Expected client ID packet")),
             Err(e) => return Err(anyhow::format_err!("Invalid client ID packet: {}", e)),
@@ -75,7 +75,8 @@ impl Connection {
         // working and we're done.
         let mut stream = TcpStream::connect(&self.addr).await?;
         net::configure_performance_tcp_socket(&mut stream)?;
-        let (mut read, mut write) = stream.into_split();
+        let (read, mut write) = stream.into_split();
+        let mut read = net::new_framed_reader(read);
 
         // 0. send the current protocol version
         net::send_size_prefixed(
@@ -84,11 +85,8 @@ impl Connection {
         )
         .await?;
 
-        // 1. receive server public key
-        let mut buffer = Vec::new();
-
-        net::recv_size_prefixed(&mut read, &mut buffer).await?;
-        let pubkey_bytes = match net::ClientServerPacket::from_vec(buffer.clone()) {
+        let buffer = net::recv_size_prefixed(&mut read).await?;
+        let pubkey_bytes = match net::ClientServerPacket::from_slice(&buffer) {
             Ok(net::ClientServerPacket::PubKey(key)) => key,
             Ok(_) => {
                 return Err(anyhow::format_err!("Expected server public key packet"));
@@ -112,8 +110,8 @@ impl Connection {
         net::send_size_prefixed(&mut write, &packet.into_vec()?).await?;
 
         // 3. receive challenge
-        net::recv_size_prefixed(&mut read, &mut buffer).await?;
-        let challenge = match net::ClientServerPacket::from_vec(buffer.clone()) {
+        let buffer = net::recv_size_prefixed(&mut read).await?;
+        let challenge = match net::ClientServerPacket::from_slice(&buffer) {
             Ok(net::ClientServerPacket::Challenge(challenge)) => challenge,
             Ok(_) => return Err(anyhow::format_err!("Expected challenge packet")),
             Err(e) => return Err(anyhow::format_err!("Invalid challenge packet: {}", e)),
@@ -136,8 +134,8 @@ impl Connection {
         net::send_size_prefixed(&mut write, &packet.into_vec()?).await?;
 
         // 7. receive pong
-        net::recv_size_prefixed(&mut read, &mut buffer).await?;
-        match net::ClientServerPacket::from_vec(buffer) {
+        let buffer = net::recv_size_prefixed(&mut read).await?;
+        match net::ClientServerPacket::from_slice(&buffer) {
             Ok(net::ClientServerPacket::Ping) => (),
             Ok(_) => return Err(anyhow::format_err!("Expected pong packet")),
             Err(e) => return Err(anyhow::format_err!("Invalid pong packet: {}", e)),

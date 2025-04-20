@@ -14,14 +14,15 @@
 //! Finally, make sure you can explain why the code is the way it is before you change it. And please, don't
 //! assume that it was ever correct; so if you find a bug, it's probably real.
 //!
-use std::io::{Bytes, Read};
-
 use tokio::{
     io::{AsyncRead, AsyncWriteExt},
     net::{tcp::OwnedWriteHalf, TcpStream},
 };
 use tokio_stream::StreamExt;
-use tokio_util::{bytes::BytesMut, codec::{FramedRead, LengthDelimitedCodec}};
+use tokio_util::{
+    bytes::BytesMut,
+    codec::{FramedRead, LengthDelimitedCodec},
+};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
