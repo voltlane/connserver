@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use connection::stale::StaleConnectionManager;
 use ids::IdGenerator;
-use log::{error, info};
+use log::{debug, error, info};
 use net::{ClientServerPacket, TaggedPacket};
 use tokio::{
     net::{
@@ -51,11 +51,17 @@ impl ConnServer {
         let (master_recv_sender, master_recv_receiver) =
             mpsc::channel::<Msg>(self.config.master.channel_capacity);
 
+        let (removed_sender, removed_receiver) = mpsc::channel(2);
+
         tokio::spawn({
             async move {
-                if let Err(e) =
-                    handle_socket_duplex_master(master, master_send_receiver, master_recv_sender)
-                        .await
+                if let Err(e) = handle_socket_duplex_master(
+                    master,
+                    master_send_receiver,
+                    master_recv_sender,
+                    removed_receiver,
+                )
+                .await
                 {
                     error!("Error handling master duplex: {}", e);
                 }
@@ -64,12 +70,24 @@ impl ConnServer {
 
         let clients = Arc::new(Mutex::new(HashMap::<u64, mpsc::Sender<Msg>>::new()));
         let stale_conn_manager = StaleConnectionManager::new(self.config.clone());
-        tokio::spawn(stale_conn_manager.clone().run_cleanup());
+
+        tokio::spawn(stale_conn_manager.clone().run_cleanup(removed_sender));
 
         tokio::spawn({
             let clients = clients.clone();
+            let master_send_sender = master_send_sender.clone();
+            let stale_conn_manager = stale_conn_manager.clone();
+            let config = self.config.clone();
             async move {
-                if let Err(e) = master_recv_main_loop(master_recv_receiver, clients).await {
+                if let Err(e) = master_recv_main_loop(
+                    master_recv_receiver,
+                    master_send_sender,
+                    clients,
+                    stale_conn_manager,
+                    config,
+                )
+                .await
+                {
                     error!("Error handling master recv: {}", e);
                 }
             }
@@ -151,10 +169,12 @@ async fn handle_socket_duplex_slave(
             res = net::recv_size_prefixed(read) => {
                 match res {
                     Ok(buffer) => {
-                        if let Err(e) = recv_sender.send(Msg::Data(TaggedPacket { client_id, data: buffer.to_vec() })).await {
+                        debug!("Slave: Received data for client {}: {:?}", client_id, buffer);
+                        if let Err(e) = recv_sender.send(Msg::Data(TaggedPacket::Data { client_id, data: buffer.to_vec() })).await {
                             error!("Slave: Error sending message for client {}: {}", client_id, e);
                             return Err(e.into());
                         }
+                        debug!("Slave: Sent data to master for client {}: {:?}", client_id, buffer);
                     }
                     Err(e) => {
                         error!("Slave: Error receiving packet for client {}: {}", client_id, e);
@@ -165,9 +185,18 @@ async fn handle_socket_duplex_slave(
             Some(msg) = send_receiver.recv() => {
                 match msg {
                     Msg::Data(packet) => {
-                        if let Err(e) = net::send_size_prefixed(write, &packet.data).await {
-                            error!("Slave: Error sending message for client {}: {}", client_id, e);
-                            return Err(e.into());
+                        if let TaggedPacket::Data { client_id: id, data } = packet {
+                            if id != client_id {
+                                error!("Slave: Received message for client {} but expected {}", id, client_id);
+                                continue;
+                            }
+                            if let Err(e) = net::send_size_prefixed(write, &data).await {
+                                error!("Slave: Error sending message for client {}: {}", client_id, e);
+                                return Err(e.into());
+                            }
+                        } else {
+                            error!("Slave: Unexpected packet type from master: {:?}", packet);
+                            continue;
                         }
                     }
                     Msg::Stop => {
@@ -185,16 +214,36 @@ async fn handle_socket_duplex_master(
     socket: TcpStream,
     mut send_receiver: mpsc::Receiver<Msg>,
     recv_sender: mpsc::Sender<Msg>,
+    mut removed_receiver: mpsc::Receiver<Vec<u64>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (read, mut write) = socket.into_split();
     let mut read = net::new_framed_reader(read);
     loop {
         tokio::select! {
+            removed_client_ids = removed_receiver.recv() => {
+                if let Some(client_ids) = removed_client_ids {
+                    for client_id in client_ids {
+                        let packet = TaggedPacket::Failure { client_id, error: "Client disconnected".to_string() };
+                        if let Err(e) = net::send_tagged_packet(&mut write, packet).await {
+                            error!("Master: Error sending message for client {}: {}", client_id, e);
+                            return Err(e.into());
+                        }
+                    }
+                } else {
+                    error!("Master: Error receiving removed client IDs");
+                    return Err(anyhow::format_err!("Error receiving removed client IDs").into());
+                }
+            }
             packet = net::recv_tagged_packet(&mut read) => {
                 match packet {
                     Ok(packet) => {
-                        if let Err(e) = recv_sender.send(Msg::Data(packet.clone())).await {
-                            panic!("Master: Error sending message for client {}: {}", packet.client_id, e);
+                        if let TaggedPacket::Data { client_id, .. } = packet {
+                            if let Err(e) = recv_sender.send(Msg::Data(packet.clone())).await {
+                                panic!("Master: Error sending message for client {}: {}", client_id, e);
+                            }
+                        } else {
+                            error!("Master: Unexpected packet type from client {}: {:?}", packet.client_id(), packet);
+                            continue;
                         }
                     }
                     Err(e) => {
@@ -207,7 +256,7 @@ async fn handle_socket_duplex_master(
                 match msg {
                     Msg::Data(packet) => {
                         if let Err(e) = net::send_tagged_packet(&mut write, packet.clone()).await {
-                            panic!("Master: Error sending message for client {}: {}", packet.client_id, e);
+                            panic!("Master: Error sending message for client {}: {}", packet.client_id(), e);
                         }
                     }
                     Msg::Stop => {
@@ -219,11 +268,6 @@ async fn handle_socket_duplex_master(
         }
     }
     Ok(())
-}
-
-struct StaleClient {
-    encryption: enc::easy::Encryption,
-    disconnected: std::time::Instant,
 }
 
 async fn handle_connect(
@@ -329,34 +373,81 @@ async fn do_reconnect(
 
 async fn master_recv_main_loop(
     mut master_recv_receiver: mpsc::Receiver<Msg>,
+    master_send_sender: mpsc::Sender<Msg>,
     clients: Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>,
+    stale_conn_manager: StaleConnectionManager,
+    config: config::Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // take messages from the master_recv_receiver and send them to each client
     loop {
         if let Some(msg) = master_recv_receiver.recv().await {
             match msg {
-                Msg::Data(packet) => {
-                    let client = {
-                        let clients = clients.lock().await;
-                        clients.get(&packet.client_id).cloned()
-                    };
-                    match client {
-                        Some(client_sender) => {
-                            if let Err(e) = client_sender.send(Msg::Data(packet.clone())).await {
-                                error!(
-                                    "Error sending message to client {}: {}",
-                                    packet.client_id, e
-                                );
+                Msg::Data(packet) => match packet {
+                    TaggedPacket::Data { client_id, .. } => {
+                        let client = {
+                            let clients = clients.lock().await;
+                            clients.get(&client_id).cloned()
+                        };
+                        match client {
+                            Some(client_sender) => {
+                                if let Err(e) = client_sender.send(Msg::Data(packet.clone())).await
+                                {
+                                    error!("Error sending message to client {}: {}", client_id, e);
+                                }
+                            }
+                            None => {
+                                // Client not found, check if it's a stale client
+                                // in that case we want to enqueue the packet if that's configured.
+                                // if not, we fail the client right here.
+                                if config.clients.missed_packets_buffer_size > 0
+                                    && stale_conn_manager.has_client(client_id).await
+                                {
+                                    if let Err(e) = stale_conn_manager
+                                        .add_missed_packet(
+                                            client_id,
+                                            packet,
+                                            config.clients.missed_packets_buffer_size,
+                                        )
+                                        .await
+                                    {
+                                        error!(
+                                            "Error adding missed packet for client {}: {}, this fails the client",
+                                            client_id, e
+                                        );
+                                        stale_conn_manager.remove_stale_client(client_id).await;
+                                        let packet = TaggedPacket::Failure {
+                                            client_id,
+                                            error: "Client disconnected".to_string(),
+                                        };
+                                        if let Err(e) =
+                                            master_send_sender.send(Msg::Data(packet)).await
+                                        {
+                                            error!(
+                                                "Error sending failure message to master: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    error!("Client {} not found, missed packet buffering not enabled, failing client", client_id);
+                                    stale_conn_manager.remove_stale_client(client_id).await;
+                                    let packet = TaggedPacket::Failure {
+                                        client_id,
+                                        error: "Client not found".to_string(),
+                                    };
+                                    if let Err(e) = master_send_sender.send(Msg::Data(packet)).await
+                                    {
+                                        error!("Error sending failure message to master: {}", e);
+                                    }
+                                }
                             }
                         }
-                        None => {
-                            error!(
-                                "Client {} not found; master server is sending bogus?",
-                                packet.client_id
-                            );
-                        }
                     }
-                }
+                    _ => {
+                        error!("Unexpected packet type from master: {:?}", packet);
+                        continue;
+                    }
+                },
                 Msg::Stop => {
                     info!("Stopping master recv");
                     break Ok(());
@@ -423,7 +514,11 @@ async fn handle_client(
             "Error handling client duplex for client {}: {}",
             client_id, e
         );
-        stale_conn_manager.add_stale_client(client_id, encryption, std::time::Instant::now()).await;
+        stale_conn_manager
+            .add_stale_client(client_id, encryption, std::time::Instant::now())
+            .await;
+        let mut clients = clients.lock().await;
+        clients.remove(&client_id);
     }
 }
 

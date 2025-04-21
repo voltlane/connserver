@@ -69,6 +69,7 @@ pub struct Clients {
     pub stale_timeout_secs: u64,
     pub max_stale_clients: u64,
     pub stale_reap_interval_secs: u64,
+    pub missed_packets_buffer_size: usize,
 }
 
 impl Default for Clients {
@@ -78,6 +79,7 @@ impl Default for Clients {
             stale_timeout_secs: 60 * 5,
             max_stale_clients: u16::MAX as u64,
             stale_reap_interval_secs: 15,
+            missed_packets_buffer_size: 0,
         }
     }
 }

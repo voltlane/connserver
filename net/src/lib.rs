@@ -64,12 +64,21 @@ pub enum TaggedPacket {
 }
 
 impl TaggedPacket {
+    pub fn client_id(&self) -> u64 {
+        match self {
+            TaggedPacket::Data { client_id, .. } => *client_id,
+            TaggedPacket::Failure { client_id, .. } => *client_id,
+            TaggedPacket::Kick { client_id } => *client_id,
+            TaggedPacket::Reconnection { client_id } => *client_id,
+        }
+    }
+
     pub fn into_vec(self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.push(0x00);
         match self {
             TaggedPacket::Data { data, client_id } => {
                 buf.extend_from_slice(&client_id.to_le_bytes());
+                buf.push(0x00);
                 buf.extend_from_slice(&data);
             }
             TaggedPacket::Failure { error, client_id } => {
@@ -183,7 +192,7 @@ pub async fn send_tagged_packet<T: AsyncWriteExt + Unpin>(
     packet: TaggedPacket,
 ) -> anyhow::Result<()> {
     let data = packet.into_vec();
-    let size = data.len() as u32 + 8;
+    let size = data.len() as u32;
     let size_bytes = size.to_le_bytes();
 
     let mut combined_message = Vec::with_capacity(size as usize + 4);
