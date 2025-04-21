@@ -16,7 +16,7 @@
 //!
 use tokio::{
     io::{AsyncRead, AsyncWriteExt},
-    net::{tcp::OwnedWriteHalf, TcpStream},
+    net::TcpStream,
 };
 use tokio_stream::StreamExt;
 use tokio_util::{
@@ -24,7 +24,7 @@ use tokio_util::{
     codec::{FramedRead, LengthDelimitedCodec},
 };
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub type FramedReader<T> = FramedRead<T, LengthDelimitedCodec>;
 
@@ -56,9 +56,38 @@ impl ClientServerPacket {
 }
 
 #[derive(Clone, Debug)]
-pub struct TaggedPacket {
-    pub client_id: u64,
-    pub data: Vec<u8>,
+pub enum TaggedPacket {
+    Data { client_id: u64, data: Vec<u8> },
+    Failure { client_id: u64, error: String },
+    Kick { client_id: u64 },
+    Reconnection { client_id: u64 },
+}
+
+impl TaggedPacket {
+    pub fn into_vec(self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(0x00);
+        match self {
+            TaggedPacket::Data { data, client_id } => {
+                buf.extend_from_slice(&client_id.to_le_bytes());
+                buf.extend_from_slice(&data);
+            }
+            TaggedPacket::Failure { error, client_id } => {
+                buf.extend_from_slice(&client_id.to_le_bytes());
+                buf.push(0x01);
+                buf.extend_from_slice(error.as_bytes());
+            }
+            TaggedPacket::Kick { client_id } => {
+                buf.extend_from_slice(&client_id.to_le_bytes());
+                buf.push(0x02);
+            }
+            TaggedPacket::Reconnection { client_id } => {
+                buf.extend_from_slice(&client_id.to_le_bytes());
+                buf.push(0x03);
+            }
+        }
+        buf
+    }
 }
 
 /// Configures a TCP socket for performance by setting relevant socket options.
@@ -115,12 +144,33 @@ pub async fn recv_tagged_packet<T: AsyncRead + Unpin>(
         return Err(anyhow::format_err!("Packet too small"));
     }
     let client_id = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
-    let buf = buffer[8..].into();
+    let buf: &[u8] = buffer[8..].into();
 
-    Ok(TaggedPacket {
-        client_id,
-        data: buf,
-    })
+    match buf[0] {
+        0x00 => {
+            // Data
+            Ok(TaggedPacket::Data {
+                client_id,
+                data: buf[1..].into(),
+            })
+        }
+        0x01 => {
+            // Failure
+            let error = String::from_utf8_lossy(&buf[1..]).to_string();
+            Ok(TaggedPacket::Failure { client_id, error })
+        }
+        0x02 => {
+            // Kick
+            Ok(TaggedPacket::Kick { client_id })
+        }
+        0x03 => {
+            // Reconnection
+            Ok(TaggedPacket::Reconnection { client_id })
+        }
+        _ => {
+            return Err(anyhow::format_err!("Unknown packet type"));
+        }
+    }
 }
 
 /// Sends a packet with a client id.
@@ -132,14 +182,13 @@ pub async fn send_tagged_packet<T: AsyncWriteExt + Unpin>(
     stream: &mut T,
     packet: TaggedPacket,
 ) -> anyhow::Result<()> {
-    let size = packet.data.len() as u32 + 8;
+    let data = packet.into_vec();
+    let size = data.len() as u32 + 8;
     let size_bytes = size.to_le_bytes();
-    let client_id_bytes = packet.client_id.to_le_bytes();
 
-    let mut combined_message = Vec::with_capacity(4 + 8 + packet.data.len());
+    let mut combined_message = Vec::with_capacity(size as usize + 4);
     combined_message.extend_from_slice(&size_bytes);
-    combined_message.extend_from_slice(&client_id_bytes);
-    combined_message.extend_from_slice(&packet.data);
+    combined_message.extend_from_slice(&data);
 
     stream.write_all(&combined_message).await?;
     Ok(())
