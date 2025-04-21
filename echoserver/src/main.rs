@@ -6,13 +6,26 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:42001").await?;
     loop {
         let (mut socket, _) = listener.accept().await?;
-        socket.set_nodelay(true)?;
+        net::configure_performance_tcp_socket(&mut socket)?;
         tokio::spawn(async move {
-            let mut buf = [0; 8192]; // 8 KB buffer
+            let (read, mut write) = socket.split();
+            let mut read = net::new_framed_reader(read);
+
             loop {
-                let n = socket.read(&mut buf).await.unwrap();
-                if n == 0 { return; } // EOF
-                socket.write_all(&buf[..n]).await.unwrap();
+                let buffer = match net::recv_tagged_packet(&mut read).await {
+                    Ok(buffer) => buffer,
+                    Err(err) => {
+                        eprintln!("Error receiving data: {}", err);
+                        break;
+                    }
+                };
+                println!("Received data: {:?}", buffer);
+
+                // Echo the data back to the client
+                if let Err(err) = net::send_tagged_packet(&mut write, buffer).await {
+                    eprintln!("Error sending data: {}", err);
+                    break;
+                }
             }
         });
     }

@@ -55,7 +55,7 @@ impl ClientServerPacket {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TaggedPacket {
     pub client_id: u64,
     pub data: Vec<u8>,
@@ -128,8 +128,8 @@ pub async fn recv_tagged_packet<T: AsyncRead + Unpin>(
 /// # Cancellation Safety
 ///
 /// This method is NOT cancellation safe.
-pub async fn send_tagged_packet(
-    stream: &mut OwnedWriteHalf,
+pub async fn send_tagged_packet<T: AsyncWriteExt + Unpin>(
+    stream: &mut T,
     packet: TaggedPacket,
 ) -> anyhow::Result<()> {
     let size = packet.data.len() as u32 + 8;
