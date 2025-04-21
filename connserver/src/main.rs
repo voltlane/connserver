@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use connection::stale::StaleConnectionManager;
+use connection::stale::{StaleClient, StaleConnectionManager};
 use ids::IdGenerator;
 use log::{debug, error, info};
 use net::{ClientServerPacket, TaggedPacket};
@@ -132,13 +132,14 @@ impl ConnServer {
         let (client_sender, client_receiver) =
             mpsc::channel::<Msg>(self.config.clients.channel_capacity);
         {
-            clients.lock().await.insert(client_id, client_sender);
+            clients.lock().await.insert(client_id, client_sender.clone());
         }
         tokio::spawn({
             let master_send_sender = master_send_sender.clone();
             let keys = keys.clone();
             let clients = clients.clone();
             let id_gen = id_gen.clone();
+            let client_sender = client_sender.clone();
             async move {
                 handle_client(
                     client,
@@ -149,6 +150,7 @@ impl ConnServer {
                     stale_conn_manager,
                     client_id,
                     id_gen,
+                    client_sender,
                 )
                 .await
             }
@@ -270,13 +272,21 @@ async fn handle_socket_duplex_master(
     Ok(())
 }
 
+pub enum Either<T, U> {
+    Left(T),
+    Right(U),
+}
+
 async fn handle_connect(
     read: &mut net::FramedReader<OwnedReadHalf>,
     write: &mut OwnedWriteHalf,
     keys: &enc::easy::Keys,
     mut client_id: u64,
     stale_conn_manager: &StaleConnectionManager,
-) -> Result<(enc::easy::Encryption, u64), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    Either<(enc::easy::Encryption, u64), StaleClient>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let buffer = net::recv_size_prefixed(read).await?;
     match ClientServerPacket::from_slice(&buffer) {
         Ok(ClientServerPacket::ProtocolVersion(version)) => {
@@ -306,28 +316,32 @@ async fn handle_connect(
             // 2. send client id
             let packet = ClientServerPacket::ClientId(client_id);
             net::send_size_prefixed(write, &packet.into_vec()?).await?;
-            Ok((keys.create_encryption(&their_pubkey), client_id))
+            Ok(Either::Left((
+                keys.create_encryption(&their_pubkey),
+                client_id,
+            )))
         }
         Ok(ClientServerPacket::ClientId(id)) => {
             info!("A client is trying to reconnect as client {}", id);
             client_id = id;
             // reconnection attempt
-            let (stale_client_enc, stale_client_time) = match stale_conn_manager
-                .remove_stale_client(client_id)
-                .await
-            {
+            let stale_client = match stale_conn_manager.remove_stale_client(client_id).await {
                 Some(stale_client) => stale_client,
                 None => return Err(format!("Client ID {} not found in stale clients", id).into()),
             };
 
-            if let Err(e) = do_reconnect(read, write, &stale_client_enc).await {
+            if let Err(e) = do_reconnect(read, write, &stale_client.encryption).await {
                 error!("Error during reconnection: {}", e);
                 stale_conn_manager
-                    .add_stale_client(client_id, stale_client_enc, stale_client_time)
+                    .add_stale_client(
+                        client_id,
+                        stale_client.encryption,
+                        stale_client.disconnected,
+                    )
                     .await;
                 return Err(format!("Failed to reconnect client {}: {}", client_id, e).into());
             } else {
-                Ok((stale_client_enc, client_id))
+                Ok(Either::Right(stale_client))
             }
         }
         _ => Err("Expected client ID or public key packet".into()),
@@ -466,16 +480,24 @@ async fn handle_client(
     stale_conn_manager: StaleConnectionManager,
     mut client_id: u64,
     id_gen: Arc<Mutex<IdGenerator>>,
+    send_sender: mpsc::Sender<Msg>,
 ) {
     let (read, mut write) = client.into_split();
     let mut read = net::new_framed_reader(read);
     let client_id_before = client_id;
     let encryption =
         match handle_connect(&mut read, &mut write, &keys, client_id, &stale_conn_manager).await {
-            Ok((enc, new_id)) => {
+            Ok(Either::Left((enc, new_id))) => {
                 client_id = new_id;
                 info!("Client {} connected", client_id);
                 enc
+            }
+            Ok(Either::Right(stale_client)) => {
+                info!("Client {} reconnected", client_id);
+                for packet in stale_client.missed_packets {
+                    send_sender.send(Msg::Data(packet)).await.unwrap();
+                }
+                stale_client.encryption
             }
             Err(e) => {
                 error!("Error handling client {}: {}", client_id, e);

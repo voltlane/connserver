@@ -8,10 +8,10 @@ use tokio::sync::{
 
 use crate::{config, ids::IdGenerator};
 
-struct StaleClient {
-    encryption: enc::easy::Encryption,
-    disconnected: std::time::Instant,
-    missed_packets: Vec<TaggedPacket>,
+pub struct StaleClient {
+    pub encryption: enc::easy::Encryption,
+    pub disconnected: std::time::Instant,
+    pub missed_packets: Vec<TaggedPacket>,
 }
 
 #[derive(Clone)]
@@ -74,13 +74,9 @@ impl StaleConnectionManager {
     pub async fn remove_stale_client(
         &self,
         client_id: u64,
-    ) -> Option<(enc::easy::Encryption, std::time::Instant)> {
+    ) -> Option<StaleClient> {
         let mut clients = self.inner.clients.write().await;
-        if let Some(client) = clients.remove(&client_id) {
-            Some((client.encryption, client.disconnected))
-        } else {
-            None
-        }
+        clients.remove(&client_id)
     }
 
     pub async fn has_client(&self, client_id: u64) -> bool {
