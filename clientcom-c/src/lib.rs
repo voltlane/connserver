@@ -21,7 +21,6 @@ pub struct VlMessage {
 }
 
 fn save_error(context: impl std::fmt::Display, err: impl std::fmt::Display) {
-    eprintln!("VOLTLANE: {}", format!("{}: {}", context, err));
     unsafe {
         LAST_ERROR = ffi::CString::new(format!("{}: {}", context, err))
             .unwrap()
