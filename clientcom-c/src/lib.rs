@@ -126,3 +126,24 @@ pub extern "C" fn vl_connection_recv(conn: *const c_void) -> VlMessage {
         }
     }
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vl_connection_reconnect(
+    conn: *const c_void,
+) -> c_int {
+    if conn.is_null() {
+        save_error("vl_connection_reconnect: conn is null", "conn is null");
+        return -1;
+    }
+    let conn = unsafe { &mut *(conn as *mut Connection) };
+    let _guard = tokio_rt.enter();
+    let result = tokio_rt.block_on(conn.reconnect());
+    if result.is_err() {
+        save_error(
+            "vl_connection_reconnect: reconnecting failed",
+            result.err().unwrap(),
+        );
+        return -1;
+    }
+    0
+}

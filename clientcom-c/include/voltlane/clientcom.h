@@ -31,6 +31,7 @@ typedef struct {
 } vl_message;
 
 // Creates a new voltlane connection to the given address.
+//
 // Returns NULL on failure.
 vl_connection* vl_connection_new(const char* address);
 
@@ -38,6 +39,7 @@ vl_connection* vl_connection_new(const char* address);
 void vl_connection_free(vl_connection* conn);
 
 // Receives a message from the server.
+//
 // The returned memory is managed, and does not need to be freed (doing so
 // is erroneous). The memory is reused for the next message, so if you want to
 // keep the message for longer, you need to copy it.
@@ -46,13 +48,23 @@ void vl_connection_free(vl_connection* conn);
 vl_message vl_connection_recv(vl_connection* conn);
 
 // Sends a message to the server.
+//
 // The message is copied, so you don't need to worry about the memory being
 // invalidated.
 // Returns 0 on success, -1 on failure.
 int vl_connection_send(vl_connection* conn, const char* message, size_t size);
 
 // Returns the last error message.
+//
 // This is a static buffer, so you don't need to free it.
 const char* vl_get_last_error(void);
+
+// Attempts to reconnect to the server.
+//
+// Call this ONLY if _recv or _send has failed, or you *know* the
+// connection is gone. You can try to send on the connection to see
+// if it's still okay, but either way you MUST make sure that the
+// connection has failed before calling this.
+int vl_connection_reconnect(vl_connection* conn);
 
 #endif // VOLTLANE_CLIENTCOM_H
