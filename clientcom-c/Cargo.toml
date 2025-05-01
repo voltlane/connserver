@@ -1,0 +1,12 @@
+[package]
+name = "clientcom_c"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clientcom = { path = "../clientcom" }
+lazy_static = "1.5.0"
+tokio = { version = "1.44.2", features = ["macros"] }
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
