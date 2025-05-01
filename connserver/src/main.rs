@@ -8,7 +8,7 @@ use std::{
 
 use connection::stale::{StaleClient, StaleConnectionManager};
 use ids::IdGenerator;
-use log::{debug, error, info};
+use log::{error, info};
 use net::{ClientServerPacket, TaggedPacket};
 use tokio::{
     net::{
@@ -206,12 +206,10 @@ async fn handle_socket_duplex_client(
             res = net::recv_size_prefixed(read) => {
                 match res {
                     Ok(buffer) => {
-                        debug!("Client: Received data for client {}: {:?}", client_id, buffer);
                         if let Err(e) = recv_sender.send(Msg::Data(TaggedPacket::Data { client_id, data: buffer.to_vec() })).await {
                             error!("Client: Error sending message for client {}: {}", client_id, e);
                             return Err(e.into());
                         }
-                        debug!("Client: Sent data to master for client {}: {:?}", client_id, buffer);
                     }
                     Err(e) => {
                         error!("Client: Error receiving packet for client {}: {}", client_id, e);

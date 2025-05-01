@@ -13,7 +13,6 @@ async fn main() -> anyhow::Result<()> {
             let mut read = net::new_framed_reader(read);
 
             loop {
-                println!("Receiving data...");
                 let packet = match net::recv_tagged_packet(&mut read).await {
                     Ok(buffer) => buffer,
                     Err(err) => {
@@ -21,7 +20,6 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
                 };
-                println!("Received data: {:?}", packet);
 
                 // Echo the data back to the client
                 if let Err(err) = net::send_tagged_packet(&mut write, packet).await {
