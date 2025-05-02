@@ -1,3 +1,10 @@
 [workspace]
 members = ["connserver", "enc", "net", "clientcom", "clientcom-c"]
 resolver = "2"
+
+[profile.release-with-debug]
+opt-level = 3
+debug = true
+lto = true
+panic = "abort"
+inherits = "release"

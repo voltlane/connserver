@@ -102,7 +102,6 @@ pub extern "C" fn vl_connection_recv(conn: *const c_void) -> VlMessage {
     }
     let conn = unsafe { &mut *(conn as *mut Connection) };
 
-    let _guard = tokio_rt.enter();
     let result = tokio_rt.block_on(net::recv_size_prefixed(&mut conn.read));
     match result {
         Ok(buffer) => {
