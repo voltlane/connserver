@@ -1,5 +1,5 @@
 [workspace]
-members = ["connserver", "enc", "net", "clientcom", "clientcom-c"]
+members = ["connserver", "enc", "net", "clientcom", "clientcom-c", "servercom"]
 resolver = "2"
 
 [profile.release-with-debug]
