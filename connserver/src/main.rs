@@ -6,7 +6,10 @@ use std::{
     },
 };
 
-use connection::stale::{StaleClient, StaleConnectionManager};
+use connection::{
+    client::Client,
+    stale::{StaleClient, StaleConnectionManager},
+};
 use ids::IdGenerator;
 use log::{error, info};
 use net::{ClientServerPacket, TaggedPacket};
@@ -152,7 +155,6 @@ impl ConnServer {
             Ok(res) => res?,
             Err(_) => return Ok(()),
         };
-        net::configure_performance_tcp_socket(&mut client)?;
 
         let client_id = id_gen.lock().await.next_id();
         info!(
@@ -192,60 +194,6 @@ impl ConnServer {
         });
         Ok(())
     }
-}
-
-async fn handle_socket_duplex_client(
-    read: &mut net::FramedReader<OwnedReadHalf>,
-    write: &mut OwnedWriteHalf,
-    mut send_receiver: mpsc::Receiver<Msg>,
-    recv_sender: mpsc::Sender<Msg>,
-    client_id: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    loop {
-        tokio::select! {
-            res = net::recv_size_prefixed(read) => {
-                match res {
-                    Ok(buffer) => {
-                        if let Err(e) = recv_sender.send(Msg::Data(TaggedPacket::Data { client_id, data: buffer.to_vec() })).await {
-                            error!("Client: Error sending message for client {}: {}", client_id, e);
-                            return Err(e.into());
-                        }
-                    }
-                    Err(e) => {
-                        error!("Client: Error receiving packet for client {}: {}", client_id, e);
-                        return Err(e.into());
-                    }
-                }
-            }
-            Some(msg) = send_receiver.recv() => {
-                match msg {
-                    Msg::Data(packet) => {
-                        match packet {
-                            TaggedPacket::Data { client_id: id, data } => {
-                                if id != client_id {
-                                    error!("Client: Received message for client {} but expected {}", id, client_id);
-                                    continue;
-                                }
-                                if let Err(e) = net::send_size_prefixed(write, &data).await {
-                                    error!("Client: Error sending message for client {}: {}", client_id, e);
-                                    return Err(e.into());
-                                }
-                            }
-                            _ => {
-                                error!("Client: Unexpected packet type from master: {:?}", packet);
-                                continue;
-                            }
-                        }
-                    }
-                    Msg::Stop => {
-                        info!("Stopping client duplex for client {}", client_id);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn handle_socket_duplex_master(
@@ -313,113 +261,6 @@ pub enum Either<T, U> {
     Right(U),
 }
 
-async fn handle_connect(
-    read: &mut net::FramedReader<OwnedReadHalf>,
-    write: &mut OwnedWriteHalf,
-    keys: &enc::easy::Keys,
-    mut client_id: u64,
-    stale_conn_manager: &StaleConnectionManager,
-) -> Result<
-    Either<(enc::easy::Encryption, u64), StaleClient>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    let buffer = net::recv_size_prefixed(read).await?;
-    match ClientServerPacket::from_slice(&buffer) {
-        Ok(ClientServerPacket::ProtocolVersion(version)) => {
-            if version != net::PROTOCOL_VERSION {
-                return Err(format!("Unsupported protocol version: {}", version).into());
-            }
-        }
-        Ok(_) => {
-            return Err("Expected protocol version packet".into());
-        }
-        Err(e) => {
-            return Err(format!("Invalid protocol version packet: {}", e).into());
-        }
-    }
-
-    // 0. send server key
-    let packet = ClientServerPacket::PubKey(keys.pubkey_to_bytes());
-    net::send_size_prefixed(write, &packet.into_vec()?).await?;
-
-    // 1. receive either pubkey or client id, depending if its a new connection or reconnection attempt
-    let buffer = net::recv_size_prefixed(read).await?;
-    match ClientServerPacket::from_slice(&buffer) {
-        Ok(ClientServerPacket::PubKey(key)) => {
-            // new connection
-            info!("New client {} is connecting", client_id);
-            let their_pubkey = enc::easy::pubkey_from_bytes(&key)?;
-            // 2. send client id
-            let packet = ClientServerPacket::ClientId(client_id);
-            net::send_size_prefixed(write, &packet.into_vec()?).await?;
-            Ok(Either::Left((
-                keys.create_encryption(&their_pubkey),
-                client_id,
-            )))
-        }
-        Ok(ClientServerPacket::ClientId(id)) => {
-            info!("A client is trying to reconnect as client {}", id);
-            client_id = id;
-            // reconnection attempt
-            let stale_client = match stale_conn_manager.remove_stale_client(client_id).await {
-                Some(stale_client) => stale_client,
-                None => return Err(format!("Client ID {} not found in stale clients", id).into()),
-            };
-
-            if let Err(e) = do_reconnect(read, write, &stale_client.encryption).await {
-                error!("Error during reconnection: {}", e);
-                stale_conn_manager
-                    .add_stale_client(
-                        client_id,
-                        stale_client.encryption,
-                        stale_client.disconnected,
-                    )
-                    .await;
-                return Err(format!("Failed to reconnect client {}: {}", client_id, e).into());
-            } else {
-                Ok(Either::Right(stale_client))
-            }
-        }
-        _ => Err("Expected client ID or public key packet".into()),
-    }
-}
-
-async fn do_reconnect(
-    read: &mut FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
-    write: &mut OwnedWriteHalf,
-    stale_client_enc: &enc::easy::Encryption,
-) -> anyhow::Result<()> {
-    let challenge_bytes = enc::easy::random_bytes(32);
-    let encrypted_challenge = stale_client_enc.encrypt(challenge_bytes.clone());
-    let packet = ClientServerPacket::Challenge(encrypted_challenge);
-    net::send_size_prefixed(write, &packet.into_vec()?).await?;
-    let buffer = net::recv_size_prefixed(read).await?;
-    let response = match ClientServerPacket::from_slice(&buffer) {
-        Ok(ClientServerPacket::ChallengeResponse(response)) => response,
-        Ok(_) => return Err(anyhow::format_err!("Expected challenge response packet")),
-        Err(e) => {
-            return Err(anyhow::format_err!(
-                "Invalid challenge response packet: {}",
-                e
-            ))
-        }
-    };
-    let decrypted_response = stale_client_enc
-        .decrypt(response)
-        .map_err(|e| anyhow::format_err!("Failed to decrypt challenge response: {}", e))?;
-    if decrypted_response != challenge_bytes {
-        return Err(anyhow::format_err!("Challenge response does not match"));
-    }
-    let buffer = net::recv_size_prefixed(read).await?;
-    match ClientServerPacket::from_slice(&buffer) {
-        Ok(ClientServerPacket::Ping) => {}
-        Ok(_) => return Err(anyhow::format_err!("Expected ping packet")),
-        Err(e) => return Err(anyhow::format_err!("Invalid ping packet: {}", e)),
-    }
-    let packet = ClientServerPacket::Ping;
-    net::send_size_prefixed(write, &packet.into_vec()?).await?;
-    Ok(())
-}
 
 async fn master_recv_main_loop(
     mut master_recv_receiver: mpsc::Receiver<Msg>,
@@ -518,28 +359,29 @@ async fn handle_client(
     id_gen: Arc<Mutex<IdGenerator>>,
     send_sender: mpsc::Sender<Msg>,
 ) {
-    let (read, mut write) = client.into_split();
-    let mut read = net::new_framed_reader(read);
+    let mut client = Client::new(client, client_receiver, master_send_sender, client_id);
     let client_id_before = client_id;
-    let encryption =
-        match handle_connect(&mut read, &mut write, &keys, client_id, &stale_conn_manager).await {
-            Ok(Either::Left((enc, new_id))) => {
-                client_id = new_id;
-                info!("Client {} connected", client_id);
-                enc
+    let encryption = match client
+        .try_reconnect(&keys, client_id, &stale_conn_manager)
+        .await
+    {
+        Ok(Either::Left((enc, new_id))) => {
+            client_id = new_id;
+            info!("Client {} connected", client_id);
+            enc
+        }
+        Ok(Either::Right(stale_client)) => {
+            info!("Client {} reconnected", client_id);
+            for packet in stale_client.missed_packets {
+                send_sender.send(Msg::Data(packet)).await.unwrap();
             }
-            Ok(Either::Right(stale_client)) => {
-                info!("Client {} reconnected", client_id);
-                for packet in stale_client.missed_packets {
-                    send_sender.send(Msg::Data(packet)).await.unwrap();
-                }
-                stale_client.encryption
-            }
-            Err(e) => {
-                error!("Error handling client {}: {}", client_id, e);
-                return;
-            }
-        };
+            stale_client.encryption
+        }
+        Err(e) => {
+            error!("Error handling client {}: {}", client_id, e);
+            return;
+        }
+    };
     if client_id != client_id_before {
         info!(
             "Client ID changed from {} to {} due to reconnect",
@@ -559,15 +401,8 @@ async fn handle_client(
         clients.insert(client_id, client_sender);
         id_gen.lock().await.release_id(client_id_before);
     }
-    if let Err(e) = handle_socket_duplex_client(
-        &mut read,
-        &mut write,
-        client_receiver,
-        master_send_sender,
-        client_id,
-    )
-    .await
-    {
+
+    if let Err(e) = client.run().await {
         error!(
             "Error handling client duplex for client {}: {}",
             client_id, e
