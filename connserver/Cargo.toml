@@ -14,6 +14,7 @@ enc = { path = "../enc" }
 anyhow = "1.0.98"
 serde = { version = "1.0.219", features = ["derive"] }
 toml = "0.8.20"
+async-trait = "0.1.88"
 
 [profile.release-with-debug]
 inherits = "release"

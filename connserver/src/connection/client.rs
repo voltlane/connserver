@@ -5,7 +5,7 @@ use tokio::{
 };
 use tokio_util::bytes::BytesMut;
 
-use crate::{Either, Msg};
+use crate::connserver::{Either, Msg};
 
 use super::stale::{StaleClient, StaleConnectionManager};
 
