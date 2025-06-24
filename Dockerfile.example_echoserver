@@ -1,0 +1,27 @@
+FROM rust:alpine3.22 AS builder
+
+RUN apk add musl-dev
+
+WORKDIR /app
+ADD clientcom ./clientcom
+ADD clientcom-c ./clientcom-c
+ADD connserver ./connserver
+ADD examples ./examples
+ADD enc ./enc
+ADD net ./net
+ADD Cargo.toml .
+ADD Cargo.lock .
+
+WORKDIR /app/examples/echoserver
+
+RUN cargo install --path .
+
+FROM alpine:3.22
+
+WORKDIR /voltlane
+
+COPY --from=builder /usr/local/cargo/bin/echoserver /usr/local/bin
+
+RUN apk add netcat-openbsd
+
+CMD ["echoserver"]

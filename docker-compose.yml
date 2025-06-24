@@ -1,0 +1,20 @@
+services:
+  voltlane-connserver:
+    build: .
+    image: voltlane.net/connserver
+    ports:
+      - "127.0.0.1:42000:42000"
+    volumes:
+      # add this if you want to supply your own config (it must exist)
+      - ./mount:/voltlane
+    restart: unless-stopped
+    stop_signal: SIGKILL
+
+  #replace this service with your own server application
+  backend-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.example_echoserver
+    image: voltlane.net/echoserver
+    restart: unless-stopped
+    stop_signal: SIGKILL

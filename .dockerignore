@@ -1,0 +1,8 @@
+/target
+/mount
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

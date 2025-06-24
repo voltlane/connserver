@@ -4,7 +4,8 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:42001").await?;
+    let listener = TcpListener::bind("0.0.0.0:42001").await?;
+    println!("Server listening on {}", listener.local_addr()?);
     loop {
         let (mut socket, _) = listener.accept().await?;
         net::configure_performance_tcp_socket(&mut socket)?;

@@ -10,6 +10,7 @@ mod master;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    _ = dotenvy::dotenv();
     env_logger::builder()
         .filter_level(log::LevelFilter::max())
         .format_timestamp(None)
@@ -30,6 +31,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if let Err(e) = config.fill_from_env() {
+        error!("Error filling config from environment: {}", e);
+        std::process::exit(1);
+    }
 
     if let Some(listen_addr) = args.listen_addr {
         info!("Overriding listener.address from commandline");
