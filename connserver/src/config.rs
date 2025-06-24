@@ -127,9 +127,6 @@ impl Config {
         if let Ok(channel_capacity) = std::env::var("VOLTLANE_MASTER_CHANNEL_CAPACITY") {
             self.master.channel_capacity = channel_capacity.parse()?;
         }
-        if let Ok(address) = std::env::var("VOLTLANE_MASTER_ADDRESS") {
-            self.master.address = address;
-        }
         if let Ok(channel_capacity) = std::env::var("VOLTLANE_CLIENTS_CHANNEL_CAPACITY") {
             self.clients.channel_capacity = channel_capacity.parse()?;
         }
