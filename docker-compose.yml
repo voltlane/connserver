@@ -1,7 +1,7 @@
 services:
   voltlane-connserver:
     build: .
-    image: voltlane.net/connserver
+    image: voltlane/connserver
     ports:
       - "127.0.0.1:42000:42000"
     volumes:
@@ -15,6 +15,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.example_echoserver
-    image: voltlane.net/echoserver
+    image: voltlane/echoserver
     restart: unless-stopped
     stop_signal: SIGKILL
