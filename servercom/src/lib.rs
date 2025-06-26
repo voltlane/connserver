@@ -1,14 +1,14 @@
-use async_trait::async_trait;
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use std::future::Future;
+use net;
 
-#[async_trait]
 pub trait MasterServer {
-    async fn handle_packet(
+    fn handle_packet(
         &mut self,
         packet: net::TaggedPacket,
         send_packet: impl AsyncFnMut(net::TaggedPacket) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()>;
+    ) -> impl Future<Output = anyhow::Result<()>>;
 }
 
 pub struct ServerCore<Client, Master>

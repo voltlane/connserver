@@ -1,15 +1,16 @@
+use std::future::Future;
+
 use net::TaggedPacket;
 use tokio::net::{
     tcp::{OwnedReadHalf, OwnedWriteHalf},
     TcpStream,
 };
 
-#[async_trait::async_trait]
 pub trait MasterDuplex: Send + Sync {
     /// Send a tagged packet to the master.
-    async fn send_packet(&mut self, packet: TaggedPacket) -> anyhow::Result<()>;
+    fn send_packet(&mut self, packet: TaggedPacket) -> impl Future<Output = anyhow::Result<()>> + Send;
     /// Receive a tagged packet from the master.
-    async fn recv_packet(&mut self) -> anyhow::Result<TaggedPacket>;
+    fn recv_packet(&mut self) -> impl Future<Output = anyhow::Result<TaggedPacket>> + Send;
 }
 
 pub struct TcpMasterDuplex {
@@ -29,7 +30,6 @@ impl TcpMasterDuplex {
     }
 }
 
-#[async_trait::async_trait]
 impl MasterDuplex for TcpMasterDuplex {
     async fn send_packet(&mut self, packet: TaggedPacket) -> anyhow::Result<()> {
         net::send_tagged_packet(&mut self.write, packet).await
